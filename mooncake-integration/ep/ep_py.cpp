@@ -3,9 +3,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/chrono.h>
 #include <pybind11/functional.h>
-#include <torch/csrc/utils/pybind.h>
 #include <torch/python.h>
-#include <torch/torch.h>
 
 namespace py = pybind11;
 

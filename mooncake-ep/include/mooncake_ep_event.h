@@ -3,7 +3,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <memory>
 #include <mooncake_ep_exception.cuh>
-#include <torch/torch.h>
+#include <c10/core/Event.h>
 
 namespace mooncake {
 
@@ -23,7 +23,10 @@ struct EventHandle {
     EventHandle(const EventHandle& other) = default;
 
     void current_stream_wait() const {
-        at::cuda::getCurrentCUDAStream().unwrap().wait(*event);
+        C10_CUDA_CHECK(cudaStreamWaitEvent(
+            at::cuda::getCurrentCUDAStream().stream(),
+            event->cuda_event(),
+            0));
     }
 };
 
@@ -36,12 +39,20 @@ inline torch::Event create_event(const at::cuda::CUDAStream& s) {
 inline void stream_wait(const at::cuda::CUDAStream& s_0,
                         const at::cuda::CUDAStream& s_1) {
     EP_HOST_ASSERT(s_0.id() != s_1.id());
-    s_0.unwrap().wait(create_event(s_1));
+    C10_CUDA_CHECK(cudaStreamWaitEvent(
+        s_0.stream(),
+        create_event(s_1).cuda_event(),
+        0
+    ));
 }
 
 inline void stream_wait(const at::cuda::CUDAStream& s,
                         const EventHandle& event) {
-    s.unwrap().wait(*event.event);
+    C10_CUDA_CHECK(cudaStreamWaitEvent(
+        s.stream(),
+        event.event->cuda_event(),
+        0
+    ));
 }
 
 }  // namespace mooncake

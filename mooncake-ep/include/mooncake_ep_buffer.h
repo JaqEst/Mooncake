@@ -12,7 +12,8 @@
 #include <mooncake_ep_configs.cuh>
 #include <mooncake_ep_event.h>
 #include <mooncake_ep_exception.cuh>
-#include <torch/torch.h>
+#include <torch/all.h>
+#include <glog/logging.h>
 
 namespace mooncake {
 
@@ -105,7 +106,7 @@ struct MooncakeEpBuffer {
     bool p2p_ipc_all_enabled_ = false;
 
     // Stream for communication
-    at::cuda::CUDAStream comm_stream;
+    cudaStream_t comm_stream;
 
     // Workspace
     void* workspace = nullptr;

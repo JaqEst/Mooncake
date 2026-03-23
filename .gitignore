@@ -194,8 +194,12 @@ libetcd_wrapper.h
 
 mooncake-wheel/mooncake/allocator.py
 mooncake-wheel/mooncake/allocator_ascend_npu.py
+mooncake-wheel/mooncake/async_store.py
+mooncake-wheel/mooncake/mooncake_client
 mooncake-wheel/mooncake/mooncake_master
 mooncake-wheel/mooncake/transfer_engine_bench
+mooncake-ep/mooncake/
+mooncake-pg/mooncake/
 
 # Claude Code Memory
 CLAUDE.md
