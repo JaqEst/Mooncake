@@ -4,10 +4,10 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
-#include <torch/torch.h>
-#include <torch/csrc/distributed/c10d/Types.hpp>
-#include <torch/csrc/distributed/c10d/Work.hpp>
-#include <torch/csrc/distributed/c10d/Store.hpp>
+#include <torch/all.h>
+#include <compat/types.h>
+#include <compat/work.h>
+#include <compat/store.h>
 #include <transfer_engine.h>
 
 #include <memory>

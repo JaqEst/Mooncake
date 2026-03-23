@@ -1,6 +1,9 @@
 #include <mooncake_backend.h>
 #include <memory>
 #include <mooncake_worker.cuh>
+#include <c10/core/Event.h>
+#include <compat/future.h>
+#include <omp.h>
 
 namespace mooncake {
 
@@ -31,7 +34,18 @@ class MooncakeWorkCuda : public ::c10d::Work {
                      std::shared_ptr<TransferGroupMeta> meta)
         : Work(-1, opType), event_(std::move(event)), meta_(std::move(meta)) {}
 
-    bool isCompleted() override { return event_->query(); }
+    bool isCompleted() override {
+        cudaError_t err = cudaEventQuery(event_->cuda_event());
+        if (err == cudaSuccess) {
+            return true;
+        } else if (err != cudaErrorNotReady) {
+            C10_CUDA_CHECK(err);
+        } else {
+            (void)cudaGetLastError();  // Reset error
+        }
+
+        return false;
+    }
 
     bool wait(std::chrono::milliseconds timeout) override {
         return true;  // This should be a no-op
@@ -76,7 +90,7 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
     for (size_t elem_idx = thread_idx; elem_idx < numElements;
          elem_idx += stride) {
         bool valid = false;
-        scalar_t acc = 0;
+        scalar_t acc = static_cast<scalar_t>(0);
         for (size_t rank = 0; rank < numRanks; ++rank) {
             if (activeRanks[rank]) {
                 if (!valid) {
@@ -159,8 +173,7 @@ void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                                                  numRanks, op.op_, activeRanks);
             break;
         default:
-            TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
-                                        dst.scalar_type()));
+            TORCH_CHECK(false, "Unsupported reduce dtype: ", dst.scalar_type());
     }
 }
 
@@ -176,31 +189,30 @@ T applyReduceOp(const T& a, const T& b, c10d::ReduceOp op) {
         case c10d::ReduceOp::MAX:
             return std::max(a, b);
         default:
-            TORCH_CHECK(false, c10::str("Unsupported reduce op: ", op));
+            TORCH_CHECK(false, "Unsupported reduce op: ", op);
     }
 }
 
 template <typename T>
 void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
                c10d::ReduceOp op, bool* activeRanks) {
-    at::parallel_for(0, numElements, 1024, [&](int64_t begin, int64_t end) {
-        for (int64_t i = begin; i < end; ++i) {
-            bool valid = false;
-            T acc{};
-            for (int64_t rank = 0; rank < numRanks; ++rank) {
-                if (activeRanks[rank]) {
-                    if (!valid) {
-                        acc = src[i + rank * numElements];
-                        valid = true;
-                    } else {
-                        acc =
-                            applyReduceOp(acc, src[i + rank * numElements], op);
-                    }
+    #pragma omp parallel for
+    for (int64_t i = 0; i < static_cast<int64_t>(numElements); ++i) {
+        bool valid = false;
+        T acc{};
+        for (int64_t rank = 0; rank < numRanks; ++rank) {
+            if (activeRanks[rank]) {
+                if (!valid) {
+                    acc = src[i + rank * numElements];
+                    valid = true;
+                } else {
+                    acc =
+                        applyReduceOp(acc, src[i + rank * numElements], op);
                 }
             }
-            dst[i] = acc;
         }
-    });
+        dst[i] = acc;
+    }
 }
 
 void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
@@ -239,8 +251,7 @@ void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
             reduceCpu((bool*)ptr, (bool*)src, num, numRanks, op, activeRanks);
             break;
         default:
-            TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
-                                        dst.scalar_type()));
+            TORCH_CHECK(false, "Unsupported reduce dtype: ", dst.scalar_type());
     }
 }
 

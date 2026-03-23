@@ -9,8 +9,8 @@
 #include <connection_poller.h>
 #include <p2p_proxy.h>
 #include <sys/types.h>
-#include <torch/torch.h>
-#include <torch/csrc/distributed/c10d/Backend.hpp>
+#include <torch/all.h>
+#include <compat/backend.h>
 #include <transfer_engine.h>
 
 namespace mooncake {

@@ -2,7 +2,7 @@
 #define MOONCAKE_P2P_PROXY_HH
 
 #include <mooncake_worker.cuh>
-#include <torch/torch.h>
+#include <torch/all.h>
 #include <array>
 #include <atomic>
 #include <cstddef>

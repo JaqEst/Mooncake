@@ -1,6 +1,9 @@
 import os
 import re
 
+import paddle
+paddle.enable_compat()
+
 from setuptools import setup
 import torch
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME

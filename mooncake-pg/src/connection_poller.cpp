@@ -4,12 +4,10 @@
 #include <cuda.h>
 #include <cuda_alike.h>
 #include <cuda_runtime.h>
-#include <torch/torch.h>
 #include <atomic>
 #include <chrono>
 #include <mutex>
 #include <thread>
-#include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -207,11 +205,14 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             std::string peerServerName;
             std::vector<uint8_t> buffer_data;
             try {
-                if (!store_->check({serverNameKey, bufferKey})) {
+                if (!store_->check(serverNameKey) ||
+                    !store_->check(bufferKey)) {
                     peerState.increaseCheckStoreBackoff();
                     return false;
                 }
-                peerServerName = store_->get_to_str(serverNameKey);
+                auto peerServerNameBytes = store_->get(serverNameKey);
+                peerServerName = std::string(peerServerNameBytes.begin(),
+                                             peerServerNameBytes.end());
                 buffer_data = store_->get(bufferKey);
 
                 if (buffer_data.size() < sizeof(SegmentInfo)) {

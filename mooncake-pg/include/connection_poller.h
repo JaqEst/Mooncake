@@ -11,7 +11,6 @@
 
 #include <mooncake_worker.cuh>
 #include <p2p_proxy.h>
-#include <torch/torch.h>
 #include <transfer_engine.h>
 
 namespace mooncake {

@@ -1,9 +1,7 @@
 #include <mooncake_backend.h>
 #include <pybind11/gil.h>
 #include <pybind11/stl.h>
-#include <torch/csrc/utils/pybind.h>
 #include <torch/python.h>
-#include <torch/torch.h>
 
 namespace py = pybind11;
 
@@ -25,19 +23,19 @@ c10::intrusive_ptr<c10d::Backend> createMooncakeCpuBackend(
         std::move(distBackendOpts), std::move(backendOptions), true);
 }
 
-__attribute__((constructor)) static void MooncakeBackendConstructor() {
-    py::object module = py::module::import("torch.distributed");
-    py::object register_backend =
-        module.attr("Backend").attr("register_backend");
-    py::dict kwargsCpu;
-    kwargsCpu["devices"] = py::make_tuple("cpu");
-    register_backend("mooncake-cpu", py::cpp_function(createMooncakeCpuBackend),
-                     /* extended_api */ true, **kwargsCpu);
-    py::dict kwargsCuda;
-    kwargsCuda["devices"] = py::make_tuple("cuda");
-    register_backend("mooncake", py::cpp_function(createMooncakeBackend),
-                     /* extended_api */ true, **kwargsCuda);
-}
+// __attribute__((constructor)) static void MooncakeBackendConstructor() {
+//     py::object module = py::module::import("torch.distributed");
+//     py::object register_backend =
+//         module.attr("Backend").attr("register_backend");
+//     py::dict kwargsCpu;
+//     kwargsCpu["devices"] = py::make_tuple("cpu");
+//     register_backend("mooncake-cpu", py::cpp_function(createMooncakeCpuBackend),
+//                      /* extended_api */ true, **kwargsCpu);
+//     py::dict kwargsCuda;
+//     kwargsCuda["devices"] = py::make_tuple("cuda");
+//     register_backend("mooncake", py::cpp_function(createMooncakeBackend),
+//                      /* extended_api */ true, **kwargsCuda);
+// }
 
 std::string getPreferredHca(c10::intrusive_ptr<c10d::Backend> backend,
                             std::string location) {
@@ -103,6 +101,155 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def(py::init<at::Tensor>(), py::arg("active_ranks"))
         .def(py::init<at::Tensor, bool>(), py::arg("active_ranks"),
              py::arg("is_extension"));
+
+    // ========== 1. OpType    ==========
+    py::enum_<c10d::OpType>(m, "OpType")
+        .value("BROADCAST", c10d::OpType::BROADCAST)
+        .value("ALLREDUCE", c10d::OpType::ALLREDUCE)
+        .value("REDUCE", c10d::OpType::REDUCE)
+        .value("ALLGATHER", c10d::OpType::ALLGATHER)
+        .value("GATHER", c10d::OpType::GATHER)
+        .value("SCATTER", c10d::OpType::SCATTER)
+        .value("REDUCE_SCATTER", c10d::OpType::REDUCE_SCATTER)
+        .value("ALLTOALL", c10d::OpType::ALLTOALL)
+        .value("SEND", c10d::OpType::SEND)
+        .value("RECV", c10d::OpType::RECV)
+        .value("BARRIER", c10d::OpType::BARRIER)
+        .export_values();
+
+    // ========== 2. ReduceOp    ==========
+    py::enum_<c10d::ReduceOp::RedOpType>(m, "ReduceOpType")
+        .value("SUM", c10d::ReduceOp::RedOpType::SUM)
+        .value("AVG", c10d::ReduceOp::RedOpType::AVG)
+        .value("PRODUCT", c10d::ReduceOp::RedOpType::PRODUCT)
+        .value("MIN", c10d::ReduceOp::RedOpType::MIN)
+        .value("MAX", c10d::ReduceOp::RedOpType::MAX)
+        .value("BAND", c10d::ReduceOp::RedOpType::BAND)
+        .value("BOR", c10d::ReduceOp::RedOpType::BOR)
+        .value("BXOR", c10d::ReduceOp::RedOpType::BXOR)
+        .export_values();
+
+    py::class_<c10d::ReduceOp, c10::intrusive_ptr<c10d::ReduceOp>>(m, "ReduceOp")
+        .def(py::init<>())
+        .def(py::init<c10d::ReduceOp::RedOpType>());
+
+    // ========== 3. Work    ==========
+    py::class_<c10d::Work, c10::intrusive_ptr<c10d::Work>>(m, "Work")
+        .def("is_completed", &c10d::Work::isCompleted)
+        .def("is_success", &c10d::Work::isSuccess)
+        .def("wait", &c10d::Work::wait,
+             py::arg("timeout") = kNoTimeout,
+             py::call_guard<py::gil_scoped_release>())
+        .def("synchronize", &c10d::Work::synchronize)
+        .def("result", &c10d::Work::result);
+
+    // ========== 4. Options    ==========
+    py::class_<c10d::BroadcastOptions>(m, "BroadcastOptions")
+        .def(py::init<>())
+        .def_readwrite("root_rank", &c10d::BroadcastOptions::rootRank)
+        .def_readwrite("root_tensor", &c10d::BroadcastOptions::rootTensor)
+        .def_readwrite("async_op", &c10d::BroadcastOptions::asyncOp);
+
+    py::class_<c10d::AllreduceOptions>(m, "AllreduceOptions")
+        .def(py::init<>())
+        .def_readwrite("reduce_op", &c10d::AllreduceOptions::reduceOp)
+        .def_readwrite("async_op", &c10d::AllreduceOptions::asyncOp);
+
+    py::class_<c10d::AllgatherOptions>(m, "AllgatherOptions")
+        .def(py::init<>())
+        .def_readwrite("async_op", &c10d::AllgatherOptions::asyncOp);
+
+    py::class_<c10d::ReduceScatterOptions>(m, "ReduceScatterOptions")
+        .def(py::init<>())
+        .def_readwrite("reduce_op", &c10d::ReduceScatterOptions::reduceOp)
+        .def_readwrite("async_op", &c10d::ReduceScatterOptions::asyncOp);
+
+    py::class_<c10d::AllToAllOptions>(m, "AllToAllOptions")
+        .def(py::init<>())
+        .def_readwrite("async_op", &c10d::AllToAllOptions::asyncOp);
+
+    py::class_<c10d::BarrierOptions>(m, "BarrierOptions")
+        .def(py::init<>())
+        .def_readwrite("async_op", &c10d::BarrierOptions::asyncOp);
+
+    py::class_<c10d::ReduceOptions>(m, "ReduceOptions")
+        .def(py::init<>())
+        .def_readwrite("reduce_op", &c10d::ReduceOptions::reduceOp)
+        .def_readwrite("root_rank", &c10d::ReduceOptions::rootRank);
+
+    py::class_<c10d::GatherOptions>(m, "GatherOptions")
+        .def(py::init<>())
+        .def_readwrite("root_rank", &c10d::GatherOptions::rootRank);
+
+    py::class_<c10d::ScatterOptions>(m, "ScatterOptions")
+        .def(py::init<>())
+        .def_readwrite("root_rank", &c10d::ScatterOptions::rootRank);
+
+    py::class_<c10d::DistributedBackendOptions>(m, "DistributedBackendOptions")
+        .def(py::init<>())
+        .def_readwrite("store", &c10d::DistributedBackendOptions::store)
+        .def_readwrite("group_rank", &c10d::DistributedBackendOptions::group_rank)
+        .def_readwrite("group_size", &c10d::DistributedBackendOptions::group_size)
+        .def_readwrite("group_id", &c10d::DistributedBackendOptions::group_id)
+        .def_readwrite("global_ranks_in_group", &c10d::DistributedBackendOptions::global_ranks_in_group);
+
+    // ========== 5. Backend::Options    ==========
+    py::class_<c10d::Backend::Options, c10::intrusive_ptr<c10d::Backend::Options>>(
+        m, "BackendOptions")
+        .def(py::init<std::string, std::chrono::milliseconds>(),
+             py::arg("backend"),
+             py::arg("timeout") = kBackendDefaultTimeout)
+        .def_readonly("backend", &c10d::Backend::Options::backend)
+        .def_readwrite("group_name", &c10d::Backend::Options::group_name);
+
+    // ========== 6. Backend    ==========
+    py::class_<c10d::Backend, c10::intrusive_ptr<c10d::Backend>>(m, "Backend")
+        .def("get_rank", &c10d::Backend::getRank)
+        .def("get_size", &c10d::Backend::getSize)
+        .def("get_backend_name", &c10d::Backend::getBackendName)
+        .def("send", &c10d::Backend::send,
+             py::arg("tensors"), py::arg("dst_rank"), py::arg("tag"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("recv", &c10d::Backend::recv,
+             py::arg("tensors"), py::arg("src_rank"), py::arg("tag"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("broadcast", &c10d::Backend::broadcast,
+             py::arg("tensors"), py::arg("opts") = c10d::BroadcastOptions(),
+             py::call_guard<py::gil_scoped_release>())
+        .def("allreduce", &c10d::Backend::allreduce,
+             py::arg("tensors"), py::arg("opts") = c10d::AllreduceOptions(),
+             py::call_guard<py::gil_scoped_release>())
+        .def("allgather", &c10d::Backend::allgather,
+             py::arg("output_tensors"), py::arg("input_tensors"),
+             py::arg("opts") = c10d::AllgatherOptions(),
+             py::call_guard<py::gil_scoped_release>())
+        .def("_allgather_base", &c10d::Backend::_allgather_base,
+             py::arg("output_buffer"), py::arg("input_buffer"),
+             py::arg("opts") = c10d::AllgatherOptions(),
+             py::call_guard<py::gil_scoped_release>())
+        .def("_reduce_scatter_base", &c10d::Backend::_reduce_scatter_base,
+             py::arg("output_buffer"), py::arg("input_buffer"),
+             py::arg("opts") = c10d::ReduceScatterOptions(),
+             py::call_guard<py::gil_scoped_release>())
+        .def("alltoall", &c10d::Backend::alltoall,
+             py::arg("output_tensors"), py::arg("input_tensors"),
+             py::arg("opts") = c10d::AllToAllOptions(),
+             py::call_guard<py::gil_scoped_release>())
+        .def("barrier", &c10d::Backend::barrier,
+             py::arg("opts") = c10d::BarrierOptions(),
+             py::call_guard<py::gil_scoped_release>())
+        .def("reduce", &c10d::Backend::reduce,
+             py::arg("tensors"), py::arg("opts") = c10d::ReduceOptions(),
+             py::call_guard<py::gil_scoped_release>())
+        .def("gather", &c10d::Backend::gather,
+             py::arg("output_tensors"), py::arg("input_tensors"),
+             py::arg("opts") = c10d::GatherOptions(),
+             py::call_guard<py::gil_scoped_release>())
+        .def("scatter", &c10d::Backend::scatter,
+             py::arg("output_tensors"), py::arg("input_tensors"),
+             py::arg("opts") = c10d::ScatterOptions(),
+             py::call_guard<py::gil_scoped_release>())
+        .def("shutdown", &c10d::Backend::shutdown);
 }
 
 }  // namespace mooncake

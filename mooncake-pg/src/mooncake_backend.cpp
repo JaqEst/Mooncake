@@ -1,7 +1,7 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/ops/tensor.h>
 #include <cuda_runtime.h>
-#include <torch/torch.h>
-#include <torch/csrc/distributed/c10d/Backend.hpp>
+#include <torch/all.h>
 #include <cuda_alike.h>
 #include <mooncake_backend.h>
 #include <p2p_proxy.h>
@@ -9,6 +9,7 @@
 #include <chrono>
 #include <atomic>
 #include <memory>
+#include <ranges>
 #include "connection_poller.h"
 #include "mooncake_worker.cuh"
 
@@ -89,7 +90,7 @@ MooncakeBackend::MooncakeBackend(
     } else {
         int deviceId_;
         err = cudaGetDevice(&deviceId_);
-        TORCH_CHECK(!err, c10::str("Failed to get device id"));
+        TORCH_CHECK(!err, "Failed to get device id");
         location = GPU_PREFIX + std::to_string(deviceId_);
     }
 
@@ -115,7 +116,7 @@ MooncakeBackend::MooncakeBackend(
         for (size_t i = 0; i < 2; i++) {
             send_buffer_[i] = malloc(kBufferSize);
             TORCH_CHECK(send_buffer_[i],
-                        c10::str("Failed to allocate CPU send buffer"));
+                        "Failed to allocate CPU send buffer");
 
             int rc = engine_->registerLocalMemory(send_buffer_[i], kBufferSize,
                                                   location);
@@ -125,7 +126,7 @@ MooncakeBackend::MooncakeBackend(
         for (size_t i = 0; i < 2; i++) {
             recv_buffer_[i] = malloc(kBufferSize);
             TORCH_CHECK(recv_buffer_[i],
-                        c10::str("Failed to allocate CPU recv buffer"));
+                        "Failed to allocate CPU recv buffer");
 
             int rc = engine_->registerLocalMemory(recv_buffer_[i], kBufferSize,
                                                   location);
@@ -135,7 +136,7 @@ MooncakeBackend::MooncakeBackend(
     } else {
         for (size_t i = 0; i < 2; i++) {
             cudaError err = cudaMalloc(&send_buffer_[i], kBufferSize);
-            TORCH_CHECK(!err, c10::str("Failed to allocate CUDA send buffer"));
+            TORCH_CHECK(!err, "Failed to allocate CUDA send buffer");
 
             int rc = engine_->registerLocalMemory(send_buffer_[i], kBufferSize,
                                                   location);
@@ -144,7 +145,7 @@ MooncakeBackend::MooncakeBackend(
 
         for (size_t i = 0; i < 2; i++) {
             cudaError err = cudaMalloc(&recv_buffer_[i], kBufferSize);
-            TORCH_CHECK(!err, c10::str("Failed to allocate CUDA recv buffer"));
+            TORCH_CHECK(!err, "Failed to allocate CUDA recv buffer");
 
             int rc = engine_->registerLocalMemory(recv_buffer_[i], kBufferSize,
                                                   location);
@@ -170,7 +171,7 @@ MooncakeBackend::MooncakeBackend(
     }
 
     auto& dev_worker_mgr = P2PDeviceWorkerManager::GetInstance();
-    int cuda_device_index = isCpu_ ? -1 : at::cuda::current_device();
+    int cuda_device_index = isCpu_ ? -1 : phi::backends::gpu::GetCurrentDeviceId();
 
     if (isCpu_)
         p2p_device_worker_ = dev_worker_mgr.GetCPUWorker();
@@ -224,7 +225,8 @@ MooncakeBackend::MooncakeBackend(
 
     auto serverNameKey =
         ConnectionContext::getServerNameStoreKey(backendIndex_, rank_);
-    store->set(serverNameKey, localServerName);
+    store->set(serverNameKey,
+        std::vector<uint8_t>(localServerName.begin(), localServerName.end()));
 
     // Start polling connection
     ConnectionPoller::GetInstance().registerContext(connection_ctx_);
@@ -272,7 +274,7 @@ MooncakeBackend::MooncakeBackend(
         auto key = ConnectionContext::getExtensionTaskCountStoreKey(
             backendIndex_, rank_);
         while (true) {
-            if (store->check({key})) {
+            if (store->check(key)) {
                 auto data = store->get(key);
                 std::string val(data.begin(), data.end());
                 meta_->taskCount = std::stoi(val);
@@ -444,7 +446,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
                 memcpy(dst, (char*)inputTensor.data_ptr() + pos, realSize);
             },
             [=](void* src, size_t pos, size_t realSize) {
-                for (const auto j : c10::irange(outputTensors_.size())) {
+                for (const auto j : std::views::iota(0ul, outputTensors_.size())) {
                     memcpy((char*)outputTensors_[j].data_ptr() + pos,
                            (char*)src + j * realSize, realSize);
                 }
@@ -460,7 +462,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
                                 realSize, cudaMemcpyDeviceToDevice, stream);
             },
             [=](void* src, size_t pos, size_t realSize) {
-                for (const auto j : c10::irange(outputTensors_.size())) {
+                for (const auto j : std::views::iota(0ul, outputTensors_.size())) {
                     cudaMemcpyAsync((char*)outputTensors_[j].data_ptr() + pos,
                                     (char*)src + j * realSize, realSize,
                                     cudaMemcpyDeviceToDevice, stream);
@@ -482,7 +484,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
                 memcpy(dst, (char*)inputBuffer.data_ptr() + pos, realSize);
             },
             [=](void* src, size_t pos, size_t realSize) {
-                for (const auto j : c10::irange(numRanks)) {
+                for (const auto j : std::views::iota(0, numRanks)) {
                     memcpy(
                         (char*)outputBuffer.data_ptr() + j * tensorSize + pos,
                         (char*)src + j * realSize, realSize);
@@ -499,7 +501,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
                                 realSize, cudaMemcpyDeviceToDevice, stream);
             },
             [=, this](void* src, size_t pos, size_t realSize) {
-                for (const auto j : c10::irange(meta_->size)) {
+                for (const auto j : std::views::iota(0, meta_->size)) {
                     cudaMemcpyAsync(
                         (char*)outputBuffer.data_ptr() + j * tensorSize + pos,
                         (char*)src + j * realSize, realSize,
@@ -519,7 +521,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
             c10d::OpType::_REDUCE_SCATTER_BASE, tensorSize, 0, meta_,
             connection_ctx_,
             [=](void* dst, size_t pos, size_t realSize) {
-                for (const auto j : c10::irange(numRanks)) {
+                for (const auto j : std::views::iota(0, numRanks)) {
                     memcpy((char*)dst + j * realSize,
                            (char*)inputBuffer.data_ptr() + j * tensorSize + pos,
                            realSize);
@@ -537,7 +539,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
             c10d::OpType::_REDUCE_SCATTER_BASE, tensorSize, 0, meta_,
             connection_ctx_, stream,
             [=, this](void* dst, size_t pos, size_t realSize) {
-                for (const auto j : c10::irange(meta_->size)) {
+                for (const auto j : std::views::iota(0, meta_->size)) {
                     cudaMemcpyAsync(
                         (char*)dst + j * realSize,
                         (char*)inputBuffer.data_ptr() + j * tensorSize + pos,
@@ -563,13 +565,13 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
         return worker_->putTaskCpu(
             c10d::OpType::ALLTOALL, tensorSize, 0, meta_, connection_ctx_,
             [=](void* dst, size_t pos, size_t realSize) {
-                for (const auto j : c10::irange(inputTensors.size())) {
+                for (const auto j : std::views::iota(0ul, inputTensors.size())) {
                     memcpy((char*)dst + j * realSize,
                            (char*)inputTensors[j].data_ptr() + pos, realSize);
                 }
             },
             [=](void* src, size_t pos, size_t realSize) {
-                for (const auto j : c10::irange(outputTensors.size())) {
+                for (const auto j : std::views::iota(0ul, outputTensors.size())) {
                     memcpy((char*)outputTensors[j].data_ptr() + pos,
                            (char*)src + j * realSize, realSize);
                 }
@@ -581,14 +583,14 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
             c10d::OpType::ALLTOALL, tensorSize, 0, meta_, connection_ctx_,
             stream,
             [=](void* dst, size_t pos, size_t realSize) {
-                for (const auto j : c10::irange(inputTensors.size())) {
+                for (const auto j : std::views::iota(0ul, inputTensors.size())) {
                     cudaMemcpyAsync((char*)dst + j * realSize,
                                     (char*)inputTensors[j].data_ptr() + pos,
                                     realSize, cudaMemcpyDeviceToDevice, stream);
                 }
             },
             [=](void* src, size_t pos, size_t realSize) {
-                for (const auto j : c10::irange(outputTensors.size())) {
+                for (const auto j : std::views::iota(0ul, outputTensors.size())) {
                     cudaMemcpyAsync((char*)outputTensors[j].data_ptr() + pos,
                                     (char*)src + j * realSize, realSize,
                                     cudaMemcpyDeviceToDevice, stream);
@@ -669,7 +671,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
             [=](void* src, size_t pos, size_t realSize) {
                 if (isRoot) {
                     auto outputTensors_ = outputTensors.back();
-                    for (const auto j : c10::irange(outputTensors_.size())) {
+                    for (const auto j : std::views::iota(0ul, outputTensors_.size())) {
                         memcpy((char*)outputTensors_[j].data_ptr() + pos,
                                (char*)src + j * realSize, realSize);
                     }
@@ -688,7 +690,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
             [=](void* src, size_t pos, size_t realSize) {
                 if (isRoot) {
                     auto outputTensors_ = outputTensors.back();
-                    for (const auto j : c10::irange(outputTensors_.size())) {
+                    for (const auto j : std::views::iota(0ul, outputTensors_.size())) {
                         cudaMemcpyAsync(
                             (char*)outputTensors_[j].data_ptr() + pos,
                             (char*)src + j * realSize, realSize,
@@ -717,7 +719,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
             [=](void* dst, size_t pos, size_t realSize) {
                 if (isRoot) {
                     auto inputTensors_ = inputTensors.back();
-                    for (const auto j : c10::irange(inputTensors_.size())) {
+                    for (const auto j : std::views::iota(0ul, inputTensors_.size())) {
                         memcpy((char*)dst + j * realSize,
                                (char*)inputTensors_[j].data_ptr() + pos,
                                realSize);
@@ -736,7 +738,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
             [=](void* dst, size_t pos, size_t realSize) {
                 if (isRoot) {
                     auto inputTensors_ = inputTensors.back();
-                    for (const auto j : c10::irange(inputTensors_.size())) {
+                    for (const auto j : std::views::iota(0ul, inputTensors_.size())) {
                         cudaMemcpyAsync(
                             (char*)dst + j * realSize,
                             (char*)inputTensors_[j].data_ptr() + pos, realSize,
@@ -879,10 +881,12 @@ void MooncakeBackend::recoverRanks(const std::vector<int>& ranks) {
                     "Rank out of range");
         TORCH_CHECK(meta_->peerConnected[rank]);
         meta_->activeRanks[rank] = true;
+        auto taskCountStr = std::to_string(meta_->taskCount);
         meta_->store->set("extension_task_count_" +
                               std::to_string(meta_->backendIndex) + "_" +
                               std::to_string(rank),
-                          std::to_string(meta_->taskCount));
+                          std::vector<uint8_t>(taskCountStr.begin(),
+                              taskCountStr.end()));
     }
 }
 }  // namespace mooncake
