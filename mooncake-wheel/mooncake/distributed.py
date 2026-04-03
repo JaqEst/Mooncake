@@ -24,6 +24,7 @@ Example:
 """
 
 import os
+from datetime import timedelta
 from typing import List, Optional, Union, Any
 
 from mooncake.pg import ReduceOp
@@ -238,10 +239,11 @@ def is_initialized() -> bool:
 
 def init_process_group(
     backend: str = "mooncake",
+    init_method: Optional[str] = None,
     store=None,
     rank: int = -1,
     world_size: int = -1,
-    timeout: float = 900.0,
+    timeout: Optional[timedelta] = None,
     group_id: str = "default",
     pg_options=None,
 ):
@@ -250,6 +252,8 @@ def init_process_group(
 
     Args:
         backend: Backend name, "mooncake" or "mooncake-cpu"
+        init_method: URL string for rendezvous, e.g. "tcp://127.0.0.1:8361".
+                     Only TCPStore is supported currently.
         store: Distributed store instance. Maybe Paddle.base.core.TCPStore, etc.
         rank: Rank of the current process
         world_size: Total number of processes
@@ -260,12 +264,19 @@ def init_process_group(
 
     Raises:
         RuntimeError: If already initialized
-        ValueError: If store is not provided
+        AssertionError: If both init_method and store are provided
+        ValueError: If store is not provided, and init_method is not tcp://xxx:yyy
     """
     global _default_pg, _initialized
 
     if _initialized:
         raise RuntimeError("Distributed already initialized")
+
+    if not ((store is None) or (init_method is None)):
+        raise AssertionError("Cannot specify both init_method and store.")
+
+    if timeout is None:
+        timeout = _get_default_timeout()
 
     # Get rank and world_size from environment if not provided
     if rank == -1:
@@ -273,16 +284,28 @@ def init_process_group(
     if world_size == -1:
         world_size = int(os.environ.get("WORLD_SIZE", 1))
 
+    if store is None and init_method is None:
+        init_method = (
+            f"tcp://{os.getenv('MASTER_ADDR', '127.0.0.1')}"
+            f":{os.getenv('MASTER_PORT', '8361')}"
+        )
+
     # Try to get store from paddle if not provided
     if store is None:
-        try:
-            import paddle
-            store = paddle.base.core.TCPStore(
-                os.getenv('MASTER_ADDR', '127.0.0.1'),
-                int(os.getenv('MASTER_PORT', '8361')),
-                rank == 0, world_size)
-        except Exception:
-            store = None
+        if init_method.startswith("tcp://"):
+            addr = init_method[len("tcp://"):]
+            host, port_str = addr.rsplit(":", 1)
+            port = int(port_str)
+            try:
+                import paddle
+                store = paddle.base.core.TCPStore(host, port, rank == 0, world_size)
+            except Exception:
+                store = None
+        else:
+            raise ValueError(
+                f"Unsupported init_method scheme: '{init_method}'. "
+                "Only 'tcp://' is currently supported."
+            )
 
     if store is None:
         raise ValueError(
@@ -301,7 +324,7 @@ def new_group(
     ranks: List[int],
     backend: str = "mooncake",
     store=None,
-    timeout: float = 900.0,
+    timeout: Optional[timedelta] = None,
     group_id: Optional[str] = None,
     pg_options=None,
 ):
@@ -336,6 +359,9 @@ def new_group(
     if global_rank not in ranks:
         # This process is not part of the new group
         return NON_GROUP_MEMBER
+
+    if timeout is None:
+        timeout = _get_default_timeout()
 
     # Compute local rank within the new group
     local_rank = ranks.index(global_rank)
@@ -804,6 +830,9 @@ def _check_initialized():
         raise RuntimeError("Distributed not initialized. Call init_process_group() first.")
 
 
+def _get_default_timeout():
+    return timedelta(seconds=5 * 60)
+
 def _get_group(group):
     """Get process group, using default if None."""
     _check_initialized()
@@ -852,6 +881,7 @@ def _new_process_group_helper(backend, store, rank, world_size, timeout, group_i
     dist_opts.group_rank = rank
     dist_opts.group_size = world_size
     dist_opts.group_id = group_id
+    dist_opts.timeout = timeout.total_seconds()
     dist_opts.global_ranks_in_group = global_ranks
 
     if backend == "mooncake-cpu":

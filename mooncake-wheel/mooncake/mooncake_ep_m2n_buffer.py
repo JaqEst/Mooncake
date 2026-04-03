@@ -1,5 +1,5 @@
 import torch
-import torch.distributed as dist
+import mooncake.distributed as dist
 from typing import Callable, List, Optional, Tuple, Union
 
 from mooncake.mooncake_ep_buffer import Buffer, EventOverlap
@@ -226,8 +226,8 @@ class M2NBuffer:
         """
         assert self.role == 'ffn', \
             f"a2e_irecv called on {self.role} rank"
-        empty_x = torch.empty(0, self.hidden, dtype=torch.bfloat16, device='cuda')
-        empty_topk = torch.empty(0, num_topk, dtype=torch.int64, device='cuda')
+        empty_x = torch.empty(0, self.hidden, dtype=torch.bfloat16)
+        empty_topk = torch.empty(0, num_topk, dtype=torch.int64)
         return self.buffer.dispatch(
             empty_x, empty_topk, active_ranks,
             self.num_max_dispatch_tokens_per_rank, self.num_experts_total,
@@ -274,7 +274,7 @@ class M2NBuffer:
             self.num_experts_per_rank,
             self.num_ranks * self.num_max_dispatch_tokens_per_rank,
             self.hidden,
-            dtype=torch.bfloat16, device='cuda',
+            dtype=torch.bfloat16,
         )
         return self.buffer.combine(
             virtual_x, topk_idx, topk_weights, active_ranks,
@@ -314,8 +314,8 @@ class M2NBuffer:
         """
         assert self.role == 'ffn', \
             f"e2a_isend called on {self.role} rank"
-        empty_topk = torch.empty(0, 1, dtype=torch.int64, device='cuda')
-        empty_weights = torch.empty(0, 1, dtype=torch.float32, device='cuda')
+        empty_topk = torch.empty(0, 1, dtype=torch.int64)
+        empty_weights = torch.empty(0, 1, dtype=torch.float32)
         return self.buffer.combine(
             x, empty_topk, empty_weights, active_ranks,
             timeout_us, handle,
