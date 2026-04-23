@@ -29,7 +29,9 @@
 
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
+#ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
+#endif
 
 namespace mooncake {
 
@@ -242,6 +244,15 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         LOG(INFO) << "Topology discovery complete. Found "
                   << local_topology_->getHcaList().size() << " HCAs.";
 
+#ifdef USE_UB
+        Transport* ub_transport =
+            multi_transports_->installTransport("ub", local_topology_);
+        if (!ub_transport) {
+            LOG(ERROR) << "Failed to install ub transport";
+            return -1;
+        }
+#endif
+
 #ifdef USE_ASCEND_HETEROGENEOUS
         Transport* ascend_transport =
             multi_transports_->installTransport("ascend", local_topology_);
@@ -318,6 +329,21 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         }
 #endif
         // TODO: install other transports automatically
+
+#ifdef USE_HIP
+        // HIP transport handles intra-node GPU P2P via XGMI/IPC and can
+        // coexist with the cross-node transport (RDMA/TCP) selected above.
+        {
+            Transport* hip_transport =
+                multi_transports_->installTransport("hip", nullptr);
+            if (!hip_transport) {
+                LOG(WARNING) << "Failed to install HIP transport "
+                                "(intra-node GPU P2P unavailable)";
+            } else {
+                LOG(INFO) << "HIP transport installed for intra-node GPU P2P";
+            }
+        }
+#endif
     }
 #endif
 
@@ -397,6 +423,14 @@ int TransferEngineImpl::sendNotifyByName(
     Transport::NotifyDesc peer_desc;
     int ret = metadata_->sendNotify(remote_agent, notify_msg, peer_desc);
     return ret;
+}
+
+int TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
+    auto desc = metadata_->getSegmentDescByID(target_id);
+    if (!desc) {
+        return ERR_METADATA;
+    }
+    return metadata_->sendProbe(desc->name);
 }
 
 Transport::SegmentHandle TransferEngineImpl::openSegment(
@@ -506,6 +540,132 @@ int TransferEngineImpl::unregisterLocalMemory(void* addr,
     }
     return 0;
 }
+
+#ifdef ENABLE_MULTI_PROTOCOL
+// Multi-protocol API (only available when ENABLE_MULTI_PROTOCOL is defined)
+// Supports registering memory for multiple protocols (CXL, TCP / RDMA)
+int TransferEngineImpl::mp_registerLocalMemory(
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+        buffer_map) {
+    // ========== Phase 1: Pre-check ==========
+    for (const auto& entry : buffer_map) {
+        for (const auto& buffer : entry.second) {
+            if (checkOverlap(buffer.addr, buffer.length)) {
+                LOG(ERROR) << "Transfer Engine does not support overlapped "
+                              "memory region";
+                return ERR_ADDRESS_OVERLAPPED;
+            }
+            if (buffer.length == 0) {
+                LOG(ERROR) << "Transfer Engine does not support zero length "
+                              "memory region";
+                return ERR_INVALID_ARGUMENT;
+            }
+        }
+    }
+
+    // ========== Phase 2: Prepare rollback records ==========
+    std::vector<TransferEngineImpl::RegisteredRecord> success_records;
+
+    // Reserve space to reduce reallocations
+    size_t total_buffers = 0;
+    for (const auto& entry : buffer_map) {
+        total_buffers += entry.second.size();
+    }
+    success_records.reserve(total_buffers);
+
+    // ========== Phase 3: Execute registration ==========
+    for (const auto& entry : buffer_map) {
+        const std::string& protocol = entry.first;
+        const auto& buffer_list = entry.second;
+
+        auto transport = multi_transports_->getTransport(protocol);
+        if (!transport) {
+            LOG(ERROR) << "Transport " << protocol << " not found";
+            rollbackAllRegistrations(success_records);
+            return -1;
+        }
+
+        for (const auto& buffer : buffer_list) {
+            int ret = transport->registerLocalMemory(
+                buffer.addr, buffer.length, buffer.location,
+                buffer.remote_accessible, buffer.update_metadata);
+
+            if (ret < 0) {
+                LOG(ERROR) << "Failed to register memory with transport "
+                           << protocol << " addr=" << buffer.addr
+                           << " length=" << buffer.length;
+
+                // ========== Phase 4: Rollback on failure ==========
+                rollbackAllRegistrations(success_records);
+                return ret;
+            }
+
+            // Record successful registration for potential rollback
+            success_records.push_back(TransferEngineImpl::RegisteredRecord{
+                transport, buffer.addr, buffer.length, buffer.location,
+                buffer.remote_accessible});
+        }
+    }
+
+    // ========== Phase 5: Commit to system state ==========
+    {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        for (const auto& record : success_records) {
+            local_memory_regions_.push_back({record.addr, record.length,
+                                             record.location,
+                                             record.remote_accessible});
+        }
+    }
+
+    return 0;
+}
+
+void TransferEngineImpl::rollbackAllRegistrations(
+    const std::vector<RegisteredRecord>& records) {
+    LOG(INFO) << "Rolling back " << records.size() << " registered regions";
+
+    for (const auto& record : records) {
+        if (record.transport) {
+            record.transport->unregisterLocalMemory(record.addr, true);
+        }
+    }
+}
+
+int TransferEngineImpl::mp_unregisterLocalMemory(
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+        buffer_map) {
+    for (const auto& buffer_entry : buffer_map) {
+        const std::string& protocol = buffer_entry.first;
+        const std::vector<RegisteredBuffer>& buffer_list = buffer_entry.second;
+
+        auto transport = multi_transports_->getTransport(protocol);
+        if (!transport) {
+            LOG(ERROR) << "Transport " << protocol << " not found";
+            return -1;
+        }
+
+        for (const auto& buffer : buffer_list) {
+            int ret = transport->unregisterLocalMemory(buffer.addr,
+                                                       buffer.update_metadata);
+            if (ret) {
+                return ret;
+            }
+        }
+
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        for (const auto& buffer : buffer_list) {
+            for (auto it = local_memory_regions_.begin();
+                 it != local_memory_regions_.end(); ++it) {
+                if (it->addr == buffer.addr) {
+                    local_memory_regions_.erase(it);
+                    break;
+                }
+            }
+        }
+    }
+    return 0;
+}
+#endif
 
 int TransferEngineImpl::registerLocalMemoryBatch(
     const std::vector<BufferEntry>& buffer_list, const std::string& location) {

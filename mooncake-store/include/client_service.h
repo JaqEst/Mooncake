@@ -13,7 +13,7 @@
 #include <unordered_set>
 
 #include "client_metric.h"
-#include "ha/leader_coordinator.h"
+#include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
 #include "thread_pool.h"
@@ -24,6 +24,7 @@
 #include "master_metric_manager.h"
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
+#include "pinned_buffer_pool.h"
 
 namespace mooncake {
 
@@ -60,6 +61,8 @@ class QueryResult {
 class Client {
    public:
     ~Client();
+
+    const UUID& getClientId() const { return client_id_; }
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -165,6 +168,10 @@ class Client {
     tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                       const QueryResult& query_result,
                                       std::vector<Slice>& slices);
+    tl::expected<void, ErrorCode> Get(const std::string& object_key,
+                                      const QueryResult& query_result,
+                                      std::vector<Slice>& slices,
+                                      uint64_t src_offset);
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
@@ -202,6 +209,28 @@ class Client {
         const ReplicateConfig& config);
 
     /**
+     * @brief Upserts data: inserts if key doesn't exist, updates if it does
+     * @param key Object key
+     * @param slices Vector of data slices to store
+     * @param config Replication configuration
+     * @return ErrorCode indicating success/failure
+     */
+    tl::expected<void, ErrorCode> Upsert(const ObjectKey& key,
+                                         std::vector<Slice>& slices,
+                                         const ReplicateConfig& config);
+
+    /**
+     * @brief Batch upsert data with replication
+     * @param keys Object keys
+     * @param batched_slices Vector of vectors of data slices
+     * @param config Replication configuration
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
+        const std::vector<ObjectKey>& keys,
+        std::vector<std::vector<Slice>>& batched_slices,
+        const ReplicateConfig& config);
+
+    /**
      * @brief Removes an object and all its replicas
      * @param key Key to remove
      * @param force If true, skip lease and replication task checks
@@ -226,6 +255,15 @@ class Client {
      * @return tl::expected<long, ErrorCode> number of removed objects or error
      */
     tl::expected<long, ErrorCode> RemoveAll(bool force = false);
+
+    /**
+     * @brief Batch remove objects and all their replicas
+     * @param keys List of keys to remove
+     * @param force If true, skip lease and replication task checks
+     * @return Vector of expected results for each key
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchRemove(
+        const std::vector<ObjectKey>& keys, bool force = false);
 
     /**
      * @brief Notify master that a disk replica was evicted locally
@@ -409,6 +447,15 @@ class Client {
         return master_client_.CalcCacheStats();
     }
 
+    void ObserveTransferOperation(TransferOperationKind kind,
+                                  const std::string& op_name, uint64_t bytes,
+                                  uint64_t latency_us) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveTransferOperation(kind, op_name, bytes,
+                                               latency_us);
+        }
+    }
+
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {
@@ -417,6 +464,10 @@ class Client {
         std::string str;
         metrics_->serialize(str);
         return str;
+    }
+
+    SsdMetric* GetSsdMetricPtr() {
+        return metrics_ ? &metrics_->ssd_metric : nullptr;
     }
 
     [[nodiscard]] std::string GetTransportEndpoint() {
@@ -478,6 +529,8 @@ class Client {
         return admission_sketch_->increment(key) >= admission_threshold_;
     }
 
+    bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
@@ -498,10 +551,16 @@ class Client {
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
                            TransferRequest::OpCode op_code);
+    ErrorCode TransferReadInternal(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t src_offset);
     ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
                             std::vector<Slice>& slices);
     ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices);
+    ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
+                                std::vector<Slice>& slices,
+                                uint64_t src_offset);
 
     /**
      * @brief Prepare and use the storage backend for persisting data
@@ -579,6 +638,9 @@ class Client {
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
+    void StartBatchUpsert(std::vector<PutOperation>& ops,
+                          const ReplicateConfig& config);
+    void FinalizeBatchUpsert(std::vector<PutOperation>& ops);
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
 
@@ -610,15 +672,29 @@ class Client {
     const std::string protocol_;
 
     // Client persistent thread pool for async operations
+    // Pinned host memory pool for GPU D2H staging (must outlive
+    // write_thread_pool_)
+    std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
 
     // For high availability
     std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;
-    std::thread ping_thread_;
-    std::atomic<bool> ping_running_{false};
+    std::mutex leader_switch_mutex_;
+    std::optional<ha::MasterView> current_master_view_;
+    std::string direct_master_address_;
+    std::thread leader_monitor_thread_;
+    std::atomic<bool> leader_monitor_running_{false};
+    std::thread storage_heartbeat_thread_;
+    std::atomic<bool> storage_heartbeat_running_{false};
+    std::thread task_poll_thread_;
+    std::atomic<bool> task_poll_running_{false};
     std::atomic<bool> last_ping_success_{false};
-    void PingThreadMain(std::string current_master_address);
+    ErrorCode SwitchLeader(const ha::MasterView& target_view);
+    void LeaderMonitorThreadMain();
+    void StorageHeartbeatThreadMain();
+    void TaskPollThreadMain();
+    void EnsureStorageControlPlaneStarted();
     void PollAndDispatchTasks();
     void SubmitTask(const TaskAssignment& assignment);
 
@@ -661,8 +737,6 @@ class Client {
     tl::expected<void, ErrorCode> Move(const std::string& key,
                                        const std::string& source,
                                        const std::string& target);
-
-    bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
 
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;

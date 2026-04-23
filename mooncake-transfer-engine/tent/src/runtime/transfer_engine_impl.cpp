@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "tent/runtime/transfer_engine_impl.h"
+#include "tent/runtime/control_plane.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -61,8 +62,125 @@ struct Batch {
     std::vector<SubmitHook> submit_hooks;
 };
 
+struct PreservedTentConfigOverrides {
+    std::optional<std::string> metadata_type;
+    std::optional<std::string> metadata_servers;
+    std::optional<std::string> local_segment_name;
+    std::optional<std::string> rpc_server_hostname;
+    std::optional<json> rpc_server_port;
+};
+
+template <typename T>
+std::optional<T> captureExplicitConfigValue(const Config& config,
+                                            const std::string& key,
+                                            const T& default_value) {
+    if (!config.contains(key)) {
+        return std::nullopt;
+    }
+    return config.get<T>(key, default_value);
+}
+
+std::optional<long long> tryParseConfigIntString(const std::string& value) {
+    try {
+        size_t parsed_chars = 0;
+        long long parsed_value = std::stoll(value, &parsed_chars);
+        if (parsed_chars == value.size()) {
+            return parsed_value;
+        }
+    } catch (...) {
+    }
+    return std::nullopt;
+}
+
+Status validateRpcServerPortValue(long long value, const std::string& source,
+                                  uint16_t& port) {
+    constexpr long long kMinPort = 0;
+    constexpr long long kMaxPort = std::numeric_limits<uint16_t>::max();
+    if (value < kMinPort || value > kMaxPort) {
+        return Status::InvalidArgument("Invalid rpc_server_port '" + source +
+                                       "', expected value in range [0, " +
+                                       std::to_string(kMaxPort) + "]" +
+                                       LOC_MARK);
+    }
+
+    port = static_cast<uint16_t>(value);
+    return Status::OK();
+}
+
+Status getRpcServerPortFromConfig(const Config& config, uint16_t default_value,
+                                  uint16_t& port) {
+    constexpr const char* kKey = "rpc_server_port";
+    if (!config.contains(kKey)) {
+        port = default_value;
+        return Status::OK();
+    }
+
+    json raw_value = config.get<json>(kKey, json());
+    if (raw_value.is_number_integer() || raw_value.is_number_unsigned()) {
+        long long numeric_value = raw_value.get<long long>();
+        return validateRpcServerPortValue(numeric_value,
+                                          std::to_string(numeric_value), port);
+    }
+
+    if (raw_value.is_string()) {
+        auto string_value = raw_value.get<std::string>();
+        auto parsed_value = tryParseConfigIntString(string_value);
+        if (!parsed_value.has_value()) {
+            return Status::InvalidArgument(
+                "Invalid rpc_server_port '" + string_value +
+                "', expected integer in range [0, 65535]" LOC_MARK);
+        }
+        return validateRpcServerPortValue(*parsed_value, string_value, port);
+    }
+
+    return Status::InvalidArgument(
+        "rpc_server_port must be an integer or integer string" LOC_MARK);
+}
+
+PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
+    const Config& config) {
+    PreservedTentConfigOverrides preserved;
+    preserved.metadata_type =
+        captureExplicitConfigValue(config, "metadata_type", std::string());
+    preserved.metadata_servers =
+        captureExplicitConfigValue(config, "metadata_servers", std::string());
+    preserved.local_segment_name =
+        captureExplicitConfigValue(config, "local_segment_name", std::string());
+    preserved.rpc_server_hostname = captureExplicitConfigValue(
+        config, "rpc_server_hostname", std::string());
+    preserved.rpc_server_port =
+        captureExplicitConfigValue(config, "rpc_server_port", json());
+    return preserved;
+}
+
+template <typename T>
+void restoreExplicitConfigValue(Config& config, const std::string& key,
+                                const std::optional<T>& value) {
+    if (value.has_value()) {
+        config.set(key, *value);
+    }
+}
+
+void restoreExplicitTransferEngineConfig(
+    Config& config, const PreservedTentConfigOverrides& preserved) {
+    restoreExplicitConfigValue(config, "metadata_type",
+                               preserved.metadata_type);
+    restoreExplicitConfigValue(config, "metadata_servers",
+                               preserved.metadata_servers);
+    restoreExplicitConfigValue(config, "local_segment_name",
+                               preserved.local_segment_name);
+    restoreExplicitConfigValue(config, "rpc_server_hostname",
+                               preserved.rpc_server_hostname);
+    restoreExplicitConfigValue(config, "rpc_server_port",
+                               preserved.rpc_server_port);
+}
+
 TransferEngineImpl::TransferEngineImpl()
-    : conf_(std::make_shared<Config>()), available_(false) {
+    : conf_(std::make_shared<Config>()),
+      available_(false),
+      port_(0),
+      ipv6_(false),
+      merge_requests_(true) {
     ConfigHelper().loadFromEnv(*conf_);
     auto status = construct();
     if (!status.ok()) {
@@ -74,9 +192,16 @@ TransferEngineImpl::TransferEngineImpl()
 }
 
 TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf)
-    : conf_(conf), available_(false) {
-    // Load environment variables - they should override config file settings
+    : conf_(conf),
+      available_(false),
+      port_(0),
+      ipv6_(false),
+      merge_requests_(true) {
+    auto preserved = captureExplicitTransferEngineConfig(*conf_);
+    // Allow MC_TENT_CONF to supply shared defaults while keeping the caller's
+    // explicit metadata identity intact.
     ConfigHelper().loadFromEnv(*conf_);
+    restoreExplicitTransferEngineConfig(*conf_, preserved);
     auto status = construct();
     if (!status.ok()) {
         LOG(ERROR) << "Failed to construct Transfer Engine instance: "
@@ -103,19 +228,31 @@ void setLogLevel(const std::string level) {
         FLAGS_minloglevel = google::ERROR;
 }
 
+static std::string readIdentityFile(const char* path) {
+    std::ifstream file(path);
+    if (!file) return "";
+    std::string content((std::istreambuf_iterator<char>(file)),
+                        std::istreambuf_iterator<char>());
+    if (!content.empty() && content.back() == '\n') content.pop_back();
+    return content;
+}
+
 std::string getMachineID() {
-    std::ifstream file("/etc/machine-id");
-    if (file) {
-        std::string content((std::istreambuf_iterator<char>(file)),
-                            std::istreambuf_iterator<char>());
-        if (!content.empty() && content.back() == '\n') content.pop_back();
-        return content;
-    } else {
-        std::string content = "undefined_machine_";
-        for (int i = 0; i < 16; ++i)
-            content += 'a' + SimpleRandom::Get().next(26);
-        return content;
+    const std::string boot_id =
+        readIdentityFile("/proc/sys/kernel/random/boot_id");
+    const std::string machine_id = readIdentityFile("/etc/machine-id");
+
+    if (!boot_id.empty() && !machine_id.empty()) {
+        return boot_id + ":" + machine_id;
     }
+
+    if (!boot_id.empty()) return boot_id;
+    if (!machine_id.empty()) return machine_id;
+
+    std::string content = "undefined_machine_";
+    for (int i = 0; i < 16; ++i) content += 'a' + SimpleRandom::Get().next(26);
+    LOG(WARNING) << "TENT getMachineID source=fallback value=" << content;
+    return content;
 }
 
 Status TransferEngineImpl::setupLocalSegment() {
@@ -124,9 +261,9 @@ Status TransferEngineImpl::setupLocalSegment() {
     segment->name = local_segment_name_;
     segment->type = SegmentType::Memory;
     segment->machine_id = getMachineID();
+    segment->rpc_server_addr = buildIpAddrWithPort(hostname_, port_, ipv6_);
     auto& detail = std::get<MemorySegmentDesc>(segment->detail);
     detail.topology = *(topology_.get());
-    detail.rpc_server_addr = buildIpAddrWithPort(hostname_, port_, ipv6_);
     local_segment_tracker_ = std::make_unique<SegmentTracker>(segment);
     return manager.synchronizeLocal();
 }
@@ -140,6 +277,12 @@ Status TransferEngineImpl::construct() {
     const char* env_password = std::getenv("MC_REDIS_PASSWORD");
     if (env_password && *env_password) {
         redis_password = env_password;
+    }
+
+    std::string redis_username;
+    const char* env_username = std::getenv("MC_REDIS_USERNAME");
+    if (env_username && *env_username) {
+        redis_username = env_username;
     }
 
     // Get Redis DB index from environment variable or config
@@ -158,8 +301,9 @@ Status TransferEngineImpl::construct() {
     setLogLevel(conf_->get("log_level", "info"));
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
-    port_ = conf_->get("rpc_server_port", 0);
+    CHECK_STATUS(getRpcServerPortFromConfig(*conf_, 0, port_));
     merge_requests_ = conf_->get("merge_requests", true);
+    max_failover_attempts_ = conf_->get("max_failover_attempts", 3);
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
     else
@@ -181,7 +325,8 @@ Status TransferEngineImpl::construct() {
     }
 
     metadata_ = std::make_shared<ControlService>(
-        metadata_type, metadata_servers, redis_password, db_index, this);
+        metadata_type, metadata_servers, redis_username, redis_password,
+        db_index, this);
 
     CHECK_STATUS(metadata_->start(port_, ipv6_));
 
@@ -461,6 +606,13 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
 std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     TransportType request_type) {
     std::vector<TransportType> result;
+    if (request_type != UNSPEC) {
+        if (request_type >= 0 && request_type < kSupportedTransportTypes &&
+            transport_list_[request_type]) {
+            result.push_back(request_type);
+        }
+        return result;
+    }
     if (transport_list_[MNNVL]) result.push_back(MNNVL);
     if (transport_list_[NVLINK]) result.push_back(NVLINK);
     if (transport_list_[RDMA]) result.push_back(RDMA);
@@ -479,6 +631,10 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             "Mismatched addresses and sizes in registerLocalMemory" LOC_MARK);
     }
     auto transports = getSupportedTransports(options.type);
+    if (transports.empty()) {
+        return Status::InvalidArgument(
+            "No available transport for registerLocalMemory" LOC_MARK);
+    }
 
     // Build BufferDescs: warm-up → NUMA probe → fill location
     std::vector<BufferDesc> desc_list;
@@ -662,9 +818,13 @@ TransportType TransferEngineImpl::getTransportType(const Request& request,
     } else {
         auto entry = desc->findBuffer(request.target_offset, request.length);
         if (!entry) return UNSPEC;
-        bool same_machine =
-            (desc->machine_id ==
-             metadata_->segmentManager().getLocal()->machine_id);
+        bool same_machine = (request.target_id == LOCAL_SEGMENT_ID);
+        if (!same_machine) {
+            auto local_desc = metadata_->segmentManager().getLocal();
+            same_machine = local_desc && !desc->machine_id.empty() &&
+                           !local_desc->machine_id.empty() &&
+                           desc->machine_id == local_desc->machine_id;
+        }
         auto remote_mtype = getTypeEnum(LocationParser(entry->location).type());
         for (auto type : entry->transports) {
             if ((type == NVLINK || type == SHM) && !same_machine) continue;
@@ -674,6 +834,29 @@ TransportType TransferEngineImpl::getTransportType(const Request& request,
             }
         }
         return UNSPEC;
+    }
+}
+
+static const char* transportTypeName(TransportType type) {
+    switch (type) {
+        case RDMA:
+            return "RDMA";
+        case MNNVL:
+            return "MNNVL";
+        case SHM:
+            return "SHM";
+        case NVLINK:
+            return "NVLINK";
+        case GDS:
+            return "GDS";
+        case IOURING:
+            return "IOURING";
+        case TCP:
+            return "TCP";
+        case AscendDirect:
+            return "AscendDirect";
+        default:
+            return "UNSPEC";
     }
 }
 
@@ -822,18 +1005,20 @@ RequestBoundaryInfo resolveRequestBoundary(ControlService* metadata,
             toBufferKey(local_desc->findBuffer(source_addr, request.length));
     }
 
-    SegmentDesc* target_desc = nullptr;
-    if (request.target_id == LOCAL_SEGMENT_ID) {
-        target_desc = local_desc;
-    } else {
-        auto status = metadata->segmentManager().getRemoteCached(
-            target_desc, request.target_id);
-        if (!status.ok()) return boundary;
-    }
-    if (target_desc) {
-        boundary.target_key = toBufferKey(
-            target_desc->findBuffer(request.target_offset, request.length));
-    }
+    metadata->segmentManager().withCachedSegment(
+        request.target_id, [&](SegmentDesc* target_desc) {
+            auto buffer =
+                target_desc->findBuffer(request.target_offset, request.length);
+
+            if (!buffer) {
+                boundary.target_key = std::nullopt;
+                return Status::NeedsRefreshCache(
+                    "Requested address is not in registered buffer" LOC_MARK);
+            }
+
+            boundary.target_key = toBufferKey(buffer);
+            return Status::OK();
+        });
     return boundary;
 }
 
@@ -851,19 +1036,27 @@ std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
 
 void TransferEngineImpl::findStagingPolicy(const Request& request,
                                            std::vector<std::string>& policy) {
-    SegmentDesc* desc;
     if (request.target_id == LOCAL_SEGMENT_ID) return;
-    auto status =
-        metadata_->segmentManager().getRemoteCached(desc, request.target_id);
+
+    SegmentDesc* desc = nullptr;
+    BufferDesc* entry = nullptr;
+    auto status = metadata_->segmentManager().withCachedSegment(
+        request.target_id, [&](SegmentDesc* segment) {
+            desc = segment;
+            entry = desc->findBuffer(request.target_offset, request.length);
+            if (!entry)
+                return Status::NeedsRefreshCache(
+                    "Requested address is not in registered buffer" LOC_MARK);
+            return Status::OK();
+        });
+
     if (!status.ok()) return;
-    auto entry = desc->findBuffer(request.target_offset, request.length);
-    if (!entry) return;
     auto local =
         Platform::getLoader().getLocation(request.source, 1)[0].location;
     auto remote = entry->location;
     auto local_mtype = getTypeEnum(LocationParser(local).type());
     auto remote_mtype = getTypeEnum(LocationParser(remote).type());
-    auto server_addr = desc->getMemory().rpc_server_addr;
+    auto server_addr = desc->rpc_server_addr;
     policy.clear();
     // case 1: rdma without gpu direct
     if (transport_list_[RDMA] && transport_list_[NVLINK]) {
@@ -1069,13 +1262,31 @@ Status TransferEngineImpl::submitTransfer(
 
 Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto& task = batch->task_list[task_id];
+    auto prev_type = task.type;
+
+    if (++task.failover_count > max_failover_attempts_) {
+        LOG(WARNING) << "Task failover limit reached ("
+                     << max_failover_attempts_
+                     << "), last transport=" << transportTypeName(prev_type);
+        return Status::InvalidEntry(
+            "Failover limit exceeded, all transports exhausted");
+    }
+
     if (task.staging)
         task.staging = false;
     else
         task.xport_priority++;
     auto type = resolveTransport(task.request, task.xport_priority);
-    if (type == UNSPEC)
+    if (type == UNSPEC) {
+        LOG(WARNING) << "No more transports available after "
+                     << transportTypeName(prev_type) << " failed";
         return Status::InvalidEntry("All available transports are failed");
+    }
+
+    LOG(INFO) << "Transport failover: " << transportTypeName(prev_type)
+              << " -> " << transportTypeName(type) << " (attempt "
+              << task.failover_count << "/" << max_failover_attempts_ << ")";
+    TENT_RECORD_TRANSPORT_FAILOVER();
 
     auto& transport = transport_list_[type];
     if (!batch->sub_batch[type])
@@ -1095,6 +1306,25 @@ Status TransferEngineImpl::sendNotification(SegmentID target_id,
         return transport->sendNotification(target_id, notifi);
     }
     return Status::InvalidArgument("Notification not supported" LOC_MARK);
+}
+
+Status TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
+    return metadata_->segmentManager().withCachedSegment(
+        target_id, [&](SegmentDesc* segment) {
+            auto rpc_server_addr = segment->rpc_server_addr;
+            if (rpc_server_addr.empty()) {
+                return Status::NeedsRefreshCache(
+                    "Empty RPC server addr" LOC_MARK);
+            }
+            auto status = ControlClient::probe(rpc_server_addr);
+            if (status.IsRpcServiceError()) {
+                // Perhaps rpc_server_addr can be updated in the future
+                return Status::NeedsRefreshCache(
+                    "RPC service error: " + std::string{status.message()} +
+                    LOC_MARK);
+            }
+            return status;
+        });
 }
 
 Status TransferEngineImpl::receiveNotification(
@@ -1119,11 +1349,9 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         CHECK_STATUS(staging_proxy_->getStatus(&task, task_status));
     } else {
         if (task.type == UNSPEC) {
-            if (resubmitTransferTask(batch, task_id).ok())
-                task_status.s = PENDING;
-            else
-                task_status.s = FAILED;
+            task_status.s = FAILED;
             task_status.transferred_bytes = 0;
+            batch->task_list[task_id].status = task_status.s;
             return Status::OK();
         }
         auto& transport = transport_list_[task.type];
@@ -1134,11 +1362,12 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         CHECK_STATUS(transport->getTransferStatus(sub_batch, task.sub_task_id,
                                                   task_status));
     }
+    batch->task_list[task_id].status = task_status.s;
+
     if (task_status.s == FAILED && resubmitTransferTask(batch, task_id).ok()) {
         task_status.s = PENDING;
-        task_status.transferred_bytes = 0;
+        batch->task_list[task_id].status = PENDING;
     }
-    batch->task_list[task_id].status = task_status.s;
 
     // Record metrics when task transitions to terminal state
     recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
@@ -1188,8 +1417,8 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
             CHECK_STATUS(staging_proxy_->getStatus(&task, task_status));
         } else {
             if (task.type == UNSPEC) {
-                if (!resubmitTransferTask(batch, task_id).ok())
-                    overall_status.s = FAILED;
+                task.status = FAILED;
+                overall_status.s = FAILED;
                 continue;
             }
             auto& transport = transport_list_[task.type];
@@ -1201,19 +1430,24 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
             CHECK_STATUS(transport->getTransferStatus(
                 sub_batch, task.sub_task_id, task_status));
         }
+        // memorize task result
+        task.status = task_status.s;
+
+        // Attempt failover before status aggregation so that a
+        // successfully resubmitted task appears as PENDING and does not
+        // overwrite a permanent FAILED from another task in the batch.
         if (task_status.s == FAILED &&
             resubmitTransferTask(batch, task_id).ok()) {
+            task.status = PENDING;
             task_status.s = PENDING;
-            task_status.transferred_bytes = 0;
         }
+
         if (task_status.s == COMPLETED) {
             success_tasks++;
             overall_status.transferred_bytes += task_status.transferred_bytes;
-        } else {
+        } else if (task_status.s != PENDING) {
             overall_status.s = task_status.s;
         }
-        // memorize task result
-        task.status = task_status.s;
 
         // Record metrics when task transitions to terminal state
         recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,

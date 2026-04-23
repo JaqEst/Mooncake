@@ -56,6 +56,7 @@ struct TaskInfo {
     TransferStatusEnum status{TransferStatusEnum::PENDING};
     volatile TransferStatusEnum staging_status{TransferStatusEnum::PENDING};
     std::chrono::steady_clock::time_point start_time{};  // For latency tracking
+    int failover_count{0};  // Number of cross-transport failover attempts
 };
 
 class TransferEngineImpl {
@@ -139,6 +140,8 @@ class TransferEngineImpl {
 
     Status receiveNotification(std::vector<Notification>& notifi_list);
 
+    Status probePeerAliveByID(SegmentID target_id);
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status);
 
@@ -220,6 +223,7 @@ class TransferEngineImpl {
 
     std::unique_ptr<ProxyManager> staging_proxy_;
     bool merge_requests_;
+    int max_failover_attempts_{3};
 };
 }  // namespace tent
 }  // namespace mooncake

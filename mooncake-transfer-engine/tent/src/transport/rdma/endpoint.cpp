@@ -158,8 +158,6 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
             deconstruct();
             return -1;
         }
-
-        postNotifyRecv(i);
     }
 
     status_ = EP_HANDSHAKING;
@@ -167,6 +165,11 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
 }
 
 int RdmaEndPoint::deconstruct() {
+    RWSpinlock::WriteGuard guard(lock_);
+    return deconstructUnlocked();
+}
+
+int RdmaEndPoint::deconstructUnlocked() {
     if (status_ == EP_UNINIT) return 0;
     status_ = EP_RESET;
     resetInflightSlices();
@@ -280,7 +283,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
             SegmentDescRef segment_desc;
             auto& manager = transport.metadata_->segmentManager();
             CHECK_STATUS(manager.getRemote(segment_desc, peer_server_name));
-            rpc_server_addr = segment_desc->getMemory().rpc_server_addr;
+            rpc_server_addr = segment_desc->rpc_server_addr;
         }
         if (rpc_server_addr.empty()) {
             return Status::InvalidArgument(
@@ -459,7 +462,7 @@ int RdmaEndPoint::resetUnlocked() {
             context_->verbs_.ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
         if (ret) {
             PLOG(ERROR) << "ibv_modify_qp(RESET)";
-            deconstruct();
+            deconstructUnlocked();
             return -1;
         }
         cancelQuota(i, wr_depth_list_[i].value);
@@ -477,7 +480,7 @@ int RdmaEndPoint::setupAllQPs(const std::string& peer_gid, uint16_t peer_lid,
 
     if (qp_list_.size() != peer_qp_num_list.size()) {
         std::stringstream ss;
-        ss << "Inconsistent qp_mul_factor: local " << qp_list_.size()
+        ss << "Inconsistent RDMA lane count: local " << qp_list_.size()
            << " peer " << peer_qp_num_list.size() << " for endpoint "
            << peer_nic_name_ << " of " << peer_server_name_;
         LOG(ERROR) << ss.str();
@@ -512,11 +515,12 @@ static ibv_wr_opcode getOpCode(RdmaSlice* slice) {
 
 int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
                                int qp_index) {
-    // RWSpinlock::ReadGuard guard(lock_);  // TODO performance issue
     const static int kSgeEntries = 1;
-    if (status_ != EP_READY) return 0;
+    RWSpinlock::ReadGuard guard(lock_);
+    if (qp_list_.empty()) return 0;
     if (qp_index < 0) qp_index = 0;
     qp_index %= qp_list_.size();
+    if (status_ != EP_READY) return 0;
     auto cq = context_->cq(qp_index % context_->cqCount());
     int wr_count =
         std::min(cq->maxCqe() - cq->getQuota(),
@@ -531,6 +535,7 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
     ibv_send_wr* bad_wr = nullptr;
     int sge_idx = 0;
 
+    auto self = shared_from_this();
     for (int wr_idx = 0; wr_idx < wr_count; ++wr_idx) {
         auto current = slice_list[wr_idx];
         auto& wr = wr_list[wr_idx];
@@ -540,7 +545,7 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
             sge.length = current->length;
             sge.lkey = current->source_lkey;
         }
-        current->ep_weak_ptr = this;
+        current->ep_weak_ptr = self;
         current->qp_index = qp_index;
         current->failed = false;
         wr.wr_id = (uint64_t)current;
@@ -560,7 +565,8 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
 
     int rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
     if (rc) {
-        PLOG(ERROR) << "ibv_post_send";
+        LOG(ERROR) << "ibv_post_send: " << strerror(abs(rc)) << " [" << rc
+                   << "]";
         while (bad_wr) {
             slice_list[bad_wr - wr_list.data()]->failed = true;
             cancelQuota(qp_index, 1);
@@ -589,7 +595,8 @@ int RdmaEndPoint::submitRecvImmDataRequest(int qp_index, uint64_t id) {
     int rc = ibv_post_recv(qp_list_[qp_index], &wr, &bad_wr);
     if (rc) {
         cancelQuota(qp_index, 1);
-        PLOG(ERROR) << "ibv_post_recv";
+        LOG(ERROR) << "ibv_post_recv: " << strerror(abs(rc)) << " [" << rc
+                   << "]";
         return -1;
     }
     return 1;
@@ -606,7 +613,9 @@ void RdmaEndPoint::resetInflightSlices() {
 }
 
 size_t RdmaEndPoint::acknowledge(RdmaSlice* slice, TransferStatusEnum status) {
+    RWSpinlock::ReadGuard guard(lock_);
     auto qp_index = slice->qp_index;
+    if (qp_index < 0 || qp_index >= (int)slice_queue_.size()) return 0;
     auto& queue = slice_queue_[qp_index];
     if (!queue.contains(slice)) return 0;
     int num_entries = 0;
@@ -764,8 +773,10 @@ void RdmaEndPoint::postNotifyRecv(size_t idx) {
     wr.num_sge = 1;
 
     ibv_recv_wr* bad_wr = nullptr;
-    if (ibv_post_recv(notify_qp_, &wr, &bad_wr)) {
-        PLOG(ERROR) << "Failed to post notification recv";
+    int ret = ibv_post_recv(notify_qp_, &wr, &bad_wr);
+    if (ret) {
+        LOG(ERROR) << "Failed to post notification recv: " << strerror(abs(ret))
+                   << " [" << ret << "]";
     }
 }
 
@@ -916,10 +927,11 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
     ibv_send_wr* bad_wr = nullptr;
     int ret = ibv_post_send(notify_qp_, &wr, &bad_wr);
     if (ret) {
-        PLOG(ERROR) << "Failed to post notification send, "
-                    << "bad_wr id: " << (bad_wr ? bad_wr->wr_id : -1)
-                    << ", endpoint: " << peer_nic_name_ << " of "
-                    << peer_server_name_ << ", error code " << ret;
+        LOG(ERROR) << "Failed to post notification send: " << strerror(abs(ret))
+                   << " [" << ret << "], "
+                   << "bad_wr id: " << (bad_wr ? bad_wr->wr_id : -1)
+                   << ", endpoint: " << peer_nic_name_ << " of "
+                   << peer_server_name_;
         return false;
     }
 

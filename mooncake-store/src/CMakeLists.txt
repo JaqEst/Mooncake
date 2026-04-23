@@ -26,21 +26,35 @@ set(MOONCAKE_STORE_SOURCES
     http_metadata_server.cpp
     file_storage.cpp
     serialize/serializer.cpp
-    serialize/serializer_backend.cpp
-    ha/ha_backend_factory.cpp
-    ha/etcd_leader_coordinator.cpp
-    ha/master_service_supervisor.cpp
+    ha/leadership/leader_coordinator_factory.cpp
+    ha/leadership/backends/etcd/etcd_leader_coordinator.cpp
+    ha/common/redis/redis_connection.cpp
+    ha/leadership/backends/redis/redis_leader_coordinator.cpp
+    ha/leadership/master_service_supervisor.cpp
+    ha/standby_controller.cpp
+    ha/snapshot/catalog_backed_snapshot_provider.cpp
+    ha/snapshot/object/snapshot_object_store.cpp
+    ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp
+    ha/snapshot/object/backends/s3/s3_snapshot_object_store.cpp
+    ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.cpp
+    ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.cpp
     utils/type_util.cpp
     utils/file_util.cpp
     task_manager.cpp
     local_hot_cache.cpp
-    oplog_manager.cpp
-    etcd_oplog_store.cpp
-    oplog_watcher.cpp
-    oplog_applier.cpp
+    ha/oplog/oplog_manager.cpp
+    ha/oplog/etcd_oplog_store.cpp
+    ha/oplog/etcd_oplog_change_notifier.cpp
+    ha/oplog/oplog_serializer.cpp
+    ha/oplog/oplog_store_factory.cpp
+    ha/oplog/oplog_replicator.cpp
+    ha/oplog/oplog_applier.cpp
+    ha/oplog/localfs_oplog_store.cpp
+    ha/oplog/polling_oplog_change_notifier.cpp
     hot_standby_service.cpp
     standby_state_machine.cpp
-    ha_metric_manager.cpp)
+    ha_metric_manager.cpp
+    store_c.cpp)
 
 set(EXTRA_LIBS "")
 
@@ -119,41 +133,40 @@ else()
   message(STATUS "io_uring: Disabled (liburing not found)")
 endif()
 
+if(STORE_USE_REDIS)
+  list(APPEND EXTRA_LIBS ${MOONCAKE_STORE_HIREDIS_LIBRARY})
+endif()
+
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
 target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
 target_link_libraries(mooncake_store PUBLIC ${XXHASH_LIBRARY})
-# Note: transfer_engine is PRIVATE to avoid propagating its dependencies (e.g.,
-# vendor-specific hardware) to targets that don't need it (e.g.,
-# mooncake_master). Targets that need transfer_engine should link it explicitly.
-target_link_libraries(
-  mooncake_store
-  PUBLIC cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog::glog gflags::gflags
-         ${EXTRA_LIBS} asio_shared
-  PRIVATE transfer_engine)
+if(STORE_USE_REDIS)
+    target_include_directories(mooncake_store PRIVATE
+        ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
+endif()
+# Note: transfer_engine is PRIVATE to avoid propagating its dependencies (e.g., vendor-specific hardware)
+# to targets that don't need it (e.g., mooncake_master).
+# Targets that need transfer_engine should link it explicitly.
+target_link_libraries(mooncake_store
+    PUBLIC
+        cachelib_memory_allocator
+        ${ETCD_WRAPPER_LIB}
+        glog::glog
+        gflags::gflags
+        ${EXTRA_LIBS}
+        asio_shared
+    PRIVATE
+        transfer_engine
+)
 if(STORE_USE_ETCD)
-  add_dependencies(mooncake_store build_etcd_wrapper)
+    add_dependencies(mooncake_store build_etcd_wrapper)
 endif()
 
 if(URING_LIB AND URING_INCLUDE)
   target_compile_definitions(mooncake_store PUBLIC USE_URING)
   target_include_directories(mooncake_store PRIVATE ${URING_INCLUDE})
-endif()
-
-if(USE_ASCEND_DIRECT)
-  set(ACL_RUNTIME_HEADER_PATH "${ASCEND_INCLUDE_DIR}/acl/acl_rt.h")
-  if(EXISTS "${ACL_RUNTIME_HEADER_PATH}")
-    file(READ "${ACL_RUNTIME_HEADER_PATH}" ACL_RUNTIME_CONTENT)
-    if("${ACL_RUNTIME_CONTENT}" MATCHES "ACL_MEM_P2P_HUGE1G")
-      message(STATUS "ACL_MEM_P2P_HUGE1G exist.")
-      add_compile_definitions(ASCEND_SUPPORT_FABRIC_MEM)
-    else()
-      message(STATUS "ACL_MEM_P2P_HUGE1G is not exist.")
-    endif()
-  else()
-    message(WARNING "Acl runtime header file is not exist")
-  endif()
 endif()
 
 if(BUILD_SHARED_LIBS)
@@ -189,15 +202,62 @@ if(STORE_USE_ETCD)
   add_dependencies(mooncake_master build_etcd_wrapper)
 endif()
 
-target_compile_options(mooncake_master PRIVATE -Os)
-target_link_options(mooncake_master PRIVATE -Os -s)
-
 # Client server binary
 add_executable(mooncake_client real_client_main.cpp)
 # Client needs transfer_engine for data transfer operations
 target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine
                                               asio_shared)
-target_compile_options(mooncake_client PRIVATE -Os)
-target_link_options(mooncake_client PRIVATE -Os -s)
 
+# Optimize binary sizes only in Release mode
+string(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_UPPER)
+if (CMAKE_BUILD_TYPE_UPPER STREQUAL "RELEASE")
+  target_compile_options(mooncake_master PRIVATE -Os)
+  target_link_options(mooncake_master PRIVATE -Os -s)
+  target_compile_options(mooncake_client PRIVATE -Os)
+  target_link_options(mooncake_client PRIVATE -Os -s)
+endif()
+
+
+# GPU runtime library for D2H staging in PutToLocalFile / OffloadObjects.
+# transfer_engine is PRIVATE-linked, so its CUDA/HIP/Ascend dependencies
+# are not propagated; we must detect and link them independently.
+#
+# Auto-detect each toolkit regardless of global USE_CUDA/USE_HIP flags,
+# because USE_CUDA may be OFF even when GPU pointers are present
+# (e.g. WITH_NVIDIA_PEERMEM=ON uses nvidia-peermem for RDMA without cudart).
+# Each detected toolkit gets both link libraries AND compile definitions,
+# so that gpu_staging_utils.h / pinned_buffer_pool.h pick the correct backend.
+#
+# NOTE: mooncake_store is a static library (.a). External consumers (Go CGo,
+# Python pybind) that link it must also link the GPU runtime (e.g. -lcudart).
+# Go's build.sh already does this; CI workflows must do the same.
+
+find_package(CUDAToolkit QUIET)
+if(CUDAToolkit_FOUND)
+    message(STATUS "mooncake_store: CUDAToolkit detected, enabling D2H staging")
+    target_compile_definitions(mooncake_store PRIVATE USE_CUDA)
+    target_compile_definitions(mooncake_client PRIVATE USE_CUDA)
+    target_include_directories(mooncake_store PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_include_directories(mooncake_client PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(mooncake_store PRIVATE CUDA::cudart)
+    target_link_libraries(mooncake_client PRIVATE CUDA::cudart)
+endif()
+
+if(NOT CUDAToolkit_FOUND)
+    find_package(hip QUIET)
+    if(hip_FOUND)
+        message(STATUS "mooncake_store: HIP detected, enabling D2H staging")
+        target_compile_definitions(mooncake_store PRIVATE USE_HIP)
+        target_compile_definitions(mooncake_client PRIVATE USE_HIP)
+        target_link_libraries(mooncake_store PRIVATE hip::host)
+        target_link_libraries(mooncake_client PRIVATE hip::host)
+    endif()
+endif()
+
+if(USE_ASCEND OR USE_ASCEND_DIRECT OR USE_UBSHMEM)
+    target_include_directories(mooncake_store PRIVATE $ENV{ASCEND_PATH}/include)
+    target_link_libraries(mooncake_store PRIVATE ascendcl)
+    target_include_directories(mooncake_client PRIVATE $ENV{ASCEND_PATH}/include)
+    target_link_libraries(mooncake_client PRIVATE ascendcl)
+endif()
 install(TARGETS mooncake_master mooncake_client DESTINATION bin)

@@ -64,6 +64,15 @@ struct GlobalConfig {
     // ib_pci_relaxed_ordering_mode: 0: off, 1: on if supported, 2: auto
     int ib_pci_relaxed_ordering_mode = 0;
     bool ascend_use_fabric_mem = false;
+    bool ascend_agent_mode = false;
+    size_t efa_striping_threshold = 2 * 1024 * 1024;  // 2MB default
+    // ub config parameters
+    size_t num_jfc_per_ctx = 2;
+    size_t num_jfce_per_ctx = 2;
+    int eid_index = 0;
+    uint64_t max_seg_size = 0x10000000000;
+    size_t max_jfc_e = 4096;  // urma is temporarily using this default value.
+    size_t num_jetty_per_ep = 1;
 };
 
 struct RpcCommunicatorConfig {
@@ -73,13 +82,13 @@ struct RpcCommunicatorConfig {
     size_t pool_size = 10;
 };
 
-void loadGlobalConfig(GlobalConfig &config);
+void loadGlobalConfig(GlobalConfig& config);
 
 void dumpGlobalConfig();
 
-void updateGlobalConfig(ibv_device_attr &device_attr);
+void updateGlobalConfig(ibv_device_attr& device_attr);
 
-GlobalConfig &globalConfig();
+GlobalConfig& globalConfig();
 
 uint16_t getDefaultHandshakePort();
 

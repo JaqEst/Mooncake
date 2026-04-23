@@ -16,7 +16,7 @@ BUILD_DIR="${BUILD_DIR:-build}"
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/$(pwd)/build/mooncake-asio:/usr/local/lib
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/$(pwd)/build/mooncake-common:/usr/local/lib
 
 echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
@@ -29,7 +29,7 @@ echo "Creating directory structure..."
 cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
 # Copy libasio.so to mooncake directory (runtime dependency of engine.so)
-cp build/mooncake-asio/libasio.so mooncake-wheel/mooncake/libasio.so
+cp build/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
 
 # Copy store.so to mooncake directory
 if [ -f build/mooncake-integration/store.*.so ]; then
@@ -171,13 +171,12 @@ mkdir -p ${OUTPUT_DIR}
 
 echo "Installing required build packages"
 if command -v pip &>/dev/null; then
-    pip install --upgrade pip
-    pip install build setuptools wheel auditwheel
+    python${PYTHON_VERSION} -m pip install --upgrade pip build setuptools wheel auditwheel
 elif command -v uv &>/dev/null; then
     uv pip install --upgrade pip
     uv pip install build setuptools wheel auditwheel
 else
-    echo "Error: Neither pip nor uv found"
+    echo "Error: Neither python${PYTHON_VERSION}, pip nor uv found"
     exit 1
 fi
 
@@ -240,7 +239,7 @@ echo "Detected glibc version: $GLIBC_VERSION"
 echo "Using platform tag: $PLATFORM_TAG"
 
 echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-python -m build --wheel --outdir ${OUTPUT_DIR}
+python${PYTHON_VERSION} -m build --wheel --outdir ${OUTPUT_DIR}
 auditwheel repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libibverbs.so* \
@@ -283,6 +282,9 @@ auditwheel repair ${OUTPUT_DIR}/*.whl \
     --exclude libffi.so* \
     --exclude libcuda.so* \
     --exclude libcudart.so* \
+    --exclude libamdhip64.so* \
+    --exclude libhsa-runtime64.so* \
+    --exclude librocprofiler-register.so* \
     --exclude libc10.so* \
     --exclude libc10_cuda.so* \
     --exclude libtorch.so* \
@@ -333,7 +335,7 @@ if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; 
     if [ -n "$REPAIRED_WHEEL" ]; then
         echo "Injecting CUDA extension .so files into repaired wheel..."
         WHEEL_UNPACK_DIR=$(mktemp -d)
-        python -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
+        python${PYTHON_VERSION} -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
         UNPACKED_PKG_DIR=$(find "$WHEEL_UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
         for so_file in "$CUDA_EP_STAGING_DIR"/*.so; do
             if [ -f "$so_file" ]; then
@@ -342,7 +344,7 @@ if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; 
             fi
         done
         rm "$REPAIRED_WHEEL"
-        python -m wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
+        python${PYTHON_VERSION} -m wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
         rm -rf "$WHEEL_UNPACK_DIR"
     fi
 else

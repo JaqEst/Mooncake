@@ -25,7 +25,7 @@ TransferEngine::TransferEngine()
 
 TransferEngine::TransferEngine(const std::string config_path) {
     auto conf = std::make_shared<Config>();
-    auto status = conf->load(config_path);
+    auto status = conf->loadFile(config_path);
     if (!status.ok()) {
         LOG(WARNING) << "Failed to read config file " << config_path;
     }
@@ -148,6 +148,10 @@ Status TransferEngine::sendNotification(SegmentID target_id,
 Status TransferEngine::receiveNotification(
     std::vector<Notification>& notifi_list) {
     return impl_->receiveNotification(notifi_list);
+}
+
+Status TransferEngine::probePeerAliveByID(SegmentID target_id) {
+    return impl_->probePeerAliveByID(target_id);
 }
 
 Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,

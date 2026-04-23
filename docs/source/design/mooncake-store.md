@@ -36,13 +36,14 @@ It is possible to configure a `Client` instance to act in only one of its two ro
 * If `global_segment_size` is set to zero, the instance functions as a **pure client**, issuing requests but not contributing memory to the system.
 * If `local_buffer_size` is set to zero, it acts as a **pure server**, providing memory for storage. In this case, request operations such as `Get` or `Put` are not permitted from this instance.
 
-The `Client` can be used in two modes:
-1. **Embedded mode**: Runs in the same process as the LLM inference program (e.g., a vLLM instance), by being imported as a shared library.
-2. **Standalone mode**: Runs as an independent process. In this mode, the `Client` is separated into two parts: a **dummy** `Client` and a **real** `Client`: The **real** `Client` is a full-featured implementation that runs as a standalone process and directly communicates with other Mooncake Store components. It handles all RPC communications, memory management, and data transfer operations. The **real** `Client` is typically deployed on nodes that contribute memory to the distributed cache pool; The **dummy** `Client` is a lightweight wrapper that forwards all operations to a local **real** `Client` via RPC calls, which is designed for scenarios where the client needs to be embedded in the same process as the application (such as vLLM), but the actual Mooncake Store operations should be handled by a standalone process. The **dummy** `Client` and the **real** `Client` communicate via RPC calls and shared memory to make sure that Zero-copy transfers are still possible.
+The `Client` can be used in three ways:
+1. **Embedded mode**: Runs in the same process as the LLM inference program (e.g., a vLLM instance), by being imported as a shared library. Embedded clients issue requests directly, and when configured with `global_segment_size > 0` they also contribute memory resources to the cluster.
+2. **Embedded mode with dummy-real clients**: Each LLM inference **rank** holds an embedded **dummy** client (which holds no resources). Each LLM inference **instance** has one resource-owning **real** client (for example, with TP=8 there can be 8 dummy clients and 1 real client). All dummy clients of the same inference instance forward requests to that one real client. The real client owns the global segment (optionally) and is responsible for RPC handling, memory management, and data transfer. Dummy and real clients communicate via RPC, and use shared memory/zero-copy mechanisms for data transfer, so that the data path remains efficient.
+3. **Standalone store service**: A standalone store service (e.g., `python -m mooncake.mooncake_store_service`) wraps a client and provides the global memory/SSD resource pool. With this service, embedded clients can be configured with `global_segment_size = 0` so they contribute network/NIC resources only, while the standalone store service owns memory and storage management. This service can be deployed on the same server as the inference engine or on separate servers.
 
 Mooncake store supports two deployment methods to accommodate different availability requirements:
 1. **Default mode**: In this mode, the master service consists of a single master node, which simplifies deployment but introduces a single point of failure. If the master crashes or becomes unreachable, the system cannot continue to serve requests until it is restored.
-2. **High availability mode (unstable)**: This mode enhances fault tolerance by running the master service as a cluster of multiple master nodes coordinated through an etcd cluster. The master nodes use etcd to elect a leader, which is responsible for handling client requests.
+2. **High availability mode**: This mode enhances fault tolerance by running the master service as a cluster of multiple master nodes coordinated through an etcd cluster. The master nodes use etcd to elect a leader, which is responsible for handling client requests.
 If the current leader fails or becomes partitioned from the network, the remaining master nodes automatically perform a new leader election, ensuring continuous availability.
 
 In both modes, the leader monitors the health of all client nodes through periodic heartbeats. If a client crashes or becomes unreachable, the leader quickly detects the failure and takes appropriate action. When a client node recovers or reconnects, it can automatically rejoin the cluster without manual intervention.
@@ -100,9 +101,29 @@ The data structure details of `ReplicateConfig` are as follows:
 struct ReplicateConfig {
     size_t replica_num{1};                    // Total number of replicas for the object
     bool with_soft_pin{false};               // Whether to enable soft pin mechanism for this object
+    bool with_hard_pin{false};               // Whether to enable hard pin (never evicted)
     std::string preferred_segment{};         // Preferred segment for allocation
 };
 ```
+
+### Upsert
+
+```C++
+tl::expected<void, ErrorCode> Upsert(const ObjectKey& key,
+                                     std::vector<Slice>& slices,
+                                     const ReplicateConfig& config);
+
+std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config);
+```
+
+`Upsert` inserts `key` if it does not exist and updates the existing object if
+it does. It uses the same replication configuration model as `Put`, while
+allowing the store to reuse existing placement for in-place updates when the
+current layout permits it. `BatchUpsert` performs the same operation for
+multiple keys using a shared replication configuration.
 
 ### Remove
 
@@ -515,6 +536,40 @@ The Master Service handles object-related interfaces as follows:
 
 Before writing an object, the Client calls PutStart to request storage space allocation from the Master Service. After completing data writing, the Client calls PutEnd to notify the Master Service to mark the object write as completed.
 
+- Upsert
+
+```C++
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
+    const std::string& key,
+    const std::vector<size_t>& slice_lengths,
+    const ReplicateConfig& config);
+
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+BatchUpsertStart(const std::vector<std::string>& keys,
+                 const std::vector<std::vector<uint64_t>>& slice_lengths,
+                 const ReplicateConfig& config);
+
+tl::expected<void, ErrorCode> UpsertEnd(
+    const std::string& key, ReplicaType replica_type);
+
+std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
+    const std::vector<std::string>& keys);
+
+tl::expected<void, ErrorCode> UpsertRevoke(
+    const std::string& key, ReplicaType replica_type);
+
+std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
+    const std::vector<std::string>& keys);
+```
+
+`UpsertStart` / `UpsertEnd` / `UpsertRevoke` mirror the existing put lifecycle
+but operate on insert-or-update semantics. If the key does not exist, the flow
+behaves like `PutStart`. If the key already exists, the Master may reuse the
+current allocation for an in-place update or allocate new space when the object
+layout changes. The batch variants provide the same control flow for multiple
+keys and are the lower-level primitives used by the high-level `BatchUpsert`
+path.
+
 - GetReplicaList
 
 ```C++
@@ -688,6 +743,18 @@ There are two startup parameters in `master_service` related to the soft pin mec
 
 Notably, soft pinned objects can still be removed using APIs such as `Remove` or `RemoveAll`.
 
+### Hard Pin
+
+For objects that must never be evicted under any circumstances (e.g., model weights, critical metadata), Mooncake Store provides a hard pin mechanism. Unlike soft pin, hard-pinned objects are permanently protected from eviction — they will never be selected as eviction candidates regardless of memory pressure.
+
+Hard pin is set at object creation time through the `with_hard_pin` field in `ReplicateConfig` and cannot be changed afterward. Hard-pinned objects can only be removed explicitly via `Remove` (with force) or `RemoveAll`.
+
+Key differences from soft pin:
+
+- Hard pin never expires. Soft pin status is removed after a configurable TTL if the object is not accessed.
+- Hard-pinned objects are completely skipped during eviction. Soft-pinned objects may still be evicted when no other candidates are available.
+- Hard pin is immutable once set. Soft pin status is automatically refreshed on access.
+
 ### Zombie Object Cleanup
 
 If a Client crashes or experiences a network failure after sending a `PutStart` request but before it can send the corresponding `PutEnd` or `PutRevoke` request to the Master, the object initiated by `PutStart` enters a "zombie" state—rendering it neither usable nor deletable. The existence of such "zombie objects" not only consumes storage space but also prevents subsequent `Put` operations on the same keys. To mitigate these issues, the Master records the start time of each `PutStart` request and employs two timeout thresholds—`put_start_discard_timeout` and `put_start_release_timeout`—to clean up zombie objects.
@@ -712,6 +779,7 @@ The preferred segment allocation feature is implemented through the `AllocationS
 struct ReplicateConfig {
     size_t replica_num{1};                    // Total number of replicas for the object
     bool with_soft_pin{false};               // Whether to enable soft pin mechanism for this object
+    bool with_hard_pin{false};               // Whether to enable hard pin (never evicted)
     std::string preferred_segment{};         // Preferred segment for allocation
 };
 ```

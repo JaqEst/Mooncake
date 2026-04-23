@@ -26,10 +26,17 @@
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
-#include "serialize/serializer_backend.h"
+#include "ha/ha_types.h"
+#include "ha/snapshot/object/snapshot_object_store.h"
 #include "task_manager.h"
 
 namespace mooncake {
+namespace ha {
+class SnapshotCatalogStore;
+}
+
+class EtcdOpLogStore;
+
 // Forward declarations
 class AllocationStrategy;
 class EvictionStrategy;
@@ -235,6 +242,53 @@ class MasterService {
         const UUID& client_id, const std::vector<std::string>& keys);
 
     /**
+     * @brief Start an upsert operation. If the key does not exist, behaves
+     * like PutStart. If the key exists with the same size, performs in-place
+     * update (reuses existing buffers). If the key exists with a different
+     * size, deletes old replicas and allocates new ones.
+     * @return Replica descriptors on success, or error code on failure.
+     * Possible errors: OBJECT_HAS_REPLICATION_TASK (Copy/Move/Offload in
+     * progress), OBJECT_REPLICA_BUSY (replicas have non-zero refcnt).
+     */
+    auto UpsertStart(const UUID& client_id, const std::string& key,
+                     const uint64_t slice_length, const ReplicateConfig& config)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
+    /**
+     * @brief Complete an upsert operation. Delegates to PutEnd.
+     */
+    auto UpsertEnd(const UUID& client_id, const std::string& key,
+                   ReplicaType replica_type) -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Revoke an upsert operation. Delegates to PutRevoke.
+     */
+    auto UpsertRevoke(const UUID& client_id, const std::string& key,
+                      ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Start a batch of upsert operations.
+     */
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchUpsertStart(const UUID& client_id,
+                     const std::vector<std::string>& keys,
+                     const std::vector<uint64_t>& slice_lengths,
+                     const ReplicateConfig& config);
+
+    /**
+     * @brief Complete a batch of upsert operations. Delegates to BatchPutEnd.
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
+        const UUID& client_id, const std::vector<std::string>& keys);
+
+    /**
+     * @brief Revoke a batch of upsert operations. Delegates to BatchPutRevoke.
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
+        const UUID& client_id, const std::vector<std::string>& keys);
+
+    /**
      * @brief Evict a disk replica for a key (triggered by client-side disk
      * eviction).
      * @param client_id The client performing the eviction
@@ -332,6 +386,15 @@ class MasterService {
     long RemoveAll(bool force = false);
 
     /**
+     * @brief Batch remove objects and their replicas
+     * @param keys The list of keys to remove.
+     * @param force If true, skip lease and replication task checks.
+     * @return Vector of expected results for each key.
+     */
+    auto BatchRemove(const std::vector<std::string>& keys, bool force = false)
+        -> std::vector<tl::expected<void, ErrorCode>>;
+
+    /**
      * @brief Get the count of keys
      * @return The count of keys
      */
@@ -406,6 +469,28 @@ class MasterService {
                                                  const std::string& target);
 
     /**
+     * @brief Create a drain job to gracefully evacuate one or more segments.
+     */
+    tl::expected<UUID, ErrorCode> CreateDrainJob(
+        const CreateDrainJobRequest& request);
+
+    /**
+     * @brief Query the status of a drain job.
+     */
+    tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(const UUID& job_id);
+
+    /**
+     * @brief Cancel an in-flight drain job and restore draining segments to OK.
+     */
+    tl::expected<void, ErrorCode> CancelDrainJob(const UUID& job_id);
+
+    /**
+     * @brief Query current segment lifecycle state by segment name.
+     */
+    tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatus(
+        const std::string& segment_name);
+
+    /**
      * @brief Query the status of a task
      * @return Task basic info
      */
@@ -433,15 +518,33 @@ class MasterService {
     // Persist master state
     tl::expected<void, SerializationError> PersistState(
         const std::string& snapshot_id);
+    tl::expected<void, SerializationError> PersistState(
+        const ha::SnapshotDescriptor& descriptor);
+    tl::expected<ha::SnapshotDescriptor, SerializationError>
+    BuildSnapshotDescriptor(const std::string& snapshot_id,
+                            const std::string& manifest_path,
+                            const std::string& object_prefix) const;
+    tl::expected<ha::OpLogSequenceId, SerializationError>
+    ResolveSnapshotSequenceId() const;
+#ifdef STORE_USE_ETCD
+    tl::expected<EtcdOpLogStore*, SerializationError>
+    GetSnapshotBoundaryOpLogStore() const;
+#endif
 
-    tl::expected<void, SerializationError> UploadSnapshotFile(
+    tl::expected<void, SerializationError> UploadSnapshotPayloadFile(
         const std::vector<uint8_t>& data, const std::string& path,
         const std::string& local_filename, const std::string& snapshot_id);
 
+    std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore();
     void CleanupOldSnapshot(int keep_count, const std::string& snapshot_id);
+    ha::SnapshotCatalogStore* GetSnapshotCatalogStore();
 
     // Restore master state
     void RestoreState();
+    bool TryRestoreStateFromSnapshot(
+        const ha::SnapshotDescriptor& snapshot,
+        const std::chrono::system_clock::time_point& now);
+    void ResetStateAfterFailedRestoreAttempt();
 
     void WaitForSnapshotChild(pid_t pid, const std::string& snapshot_id,
                               int log_pipe_fd);
@@ -459,14 +562,21 @@ class MasterService {
     // fulfill evict ratio lowerbound.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
 
+    // Helper to get a snapshot of alive clients (under client_mutex_ shared
+    // lock)
+    std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
+
     // Clear invalid handles in all shards
     void ClearInvalidHandles();
+    void ClearInvalidHandles(
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
 
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
     void TaskCleanupThreadFunc();
+    void JobDispatchThreadFunc();
 
     // Internal data structures
     struct ObjectMetadata {
@@ -484,12 +594,13 @@ class MasterService {
             const UUID& client_id_,
             const std::chrono::system_clock::time_point put_start_time_,
             size_t value_length, std::vector<Replica>&& reps,
-            bool enable_soft_pin)
+            bool enable_soft_pin, bool enable_hard_pin = false)
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
+              hard_pinned(enable_hard_pin),
               replicas_(std::move(reps)) {
             MasterMetricManager::instance().inc_key_count(1);
             if (enable_soft_pin) {
@@ -504,8 +615,10 @@ class MasterService {
         ObjectMetadata(ObjectMetadata&&) = delete;
         ObjectMetadata& operator=(ObjectMetadata&&) = delete;
 
-        const UUID client_id;
-        const std::chrono::system_clock::time_point put_start_time;
+        // Updated by UpsertStart (Case B) to reflect the new writer.
+        UUID client_id;
+        // Updated by UpsertStart (Case B) to reset the discard timeout.
+        std::chrono::system_clock::time_point put_start_time;
         const size_t size;
 
         mutable SpinLock lock;
@@ -516,6 +629,7 @@ class MasterService {
         mutable std::optional<std::chrono::system_clock::time_point>
             soft_pin_timeout GUARDED_BY(lock);  // optional soft pin, only
                                                 // set for vip objects
+        const bool hard_pinned{false};          // immutable, set at creation
 
         void AddReplicas(std::vector<Replica>&& replicas) {
             replicas_.insert(replicas_.end(),
@@ -684,6 +798,8 @@ class MasterService {
             return soft_pin_timeout && now < *soft_pin_timeout;
         }
 
+        bool IsHardPinned() const { return hard_pinned; }
+
         // Check if the metadata is valid
         // Valid means it has at least one valid replica and size is greater
         // than 0
@@ -781,7 +897,19 @@ class MasterService {
     }
 
     // Helper to clean up stale handles pointing to unmounted segments
-    bool CleanupStaleHandles(ObjectMetadata& metadata);
+    // or local_disk replicas whose owner client is no longer alive.
+    bool CleanupStaleHandles(
+        ObjectMetadata& metadata,
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
+
+    // Helper: allocate replicas, create ObjectMetadata, insert into shard,
+    // and return descriptor list.  Shared by PutStart and UpsertStart.
+    auto AllocateAndInsertMetadata(
+        MetadataShardAccessorRW& shard, const UUID& client_id,
+        const std::string& key, uint64_t value_length,
+        const ReplicateConfig& config,
+        const std::chrono::system_clock::time_point& now)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
      * @brief Helper to discard expired processing keys.
@@ -843,11 +971,21 @@ class MasterService {
               it_(shard_guard_->metadata.find(key)),
               processing_it_(shard_guard_->processing_keys.find(key)),
               replication_task_it_(shard_guard_->replication_tasks.find(key)) {
-            // Automatically clean up invalid handles
+            // Automatically clean up invalid handles (memory replicas only).
+            // Note: We only check memory replicas here to avoid lock order
+            // violation (client_mutex_ must be acquired before metadata shard).
+            // local_disk replicas are cleaned up by ClearInvalidHandles() in
+            // ClientMonitorFunc.
             if (it_ != shard_guard_->metadata.end()) {
-                if (service_->CleanupStaleHandles(it_->second)) {
+                // Erase invalid memory replicas (those with unmounted
+                // segments). No client_mutex_ needed since we only check memory
+                // replicas.
+                it_->second.EraseReplicas([](const Replica& replica) {
+                    return replica.has_invalid_mem_handle();
+                });
+                // If no valid replicas remain, delete the whole object.
+                if (!it_->second.IsValid()) {
                     this->Erase();
-
                     if (processing_it_ != shard_guard_->processing_keys.end()) {
                         this->EraseFromProcessing();
                     }
@@ -897,7 +1035,8 @@ class MasterService {
         }
 
         void Create(const UUID& client_id, uint64_t total_length,
-                    std::vector<Replica> replicas, bool enable_soft_pin) {
+                    std::vector<Replica> replicas, bool enable_soft_pin,
+                    bool enable_hard_pin = false) {
             if (Exists()) {
                 throw std::logic_error("Already exists");
             }
@@ -905,7 +1044,8 @@ class MasterService {
             auto result = shard_guard_->metadata.emplace(
                 std::piecewise_construct, std::forward_as_tuple(key_),
                 std::forward_as_tuple(client_id, now, total_length,
-                                      std::move(replicas), enable_soft_pin));
+                                      std::move(replicas), enable_soft_pin,
+                                      enable_hard_pin));
             it_ = result.first;
         }
 
@@ -1028,6 +1168,18 @@ class MasterService {
 
     const bool enable_offload_;
 
+    // Offload-on-evict: defer disk offload to eviction time
+    // (config: offload_on_evict)
+    bool offload_on_evict_{false};
+    // Force-evict: allow evicting MEMORY replicas without disk offload when cap
+    // exceeded (config: offload_force_evict, only effective when
+    // offload_on_evict_=true)
+    bool offload_force_evict_{false};
+
+    const std::string ha_backend_type_;
+
+    const std::string ha_backend_connstring_;
+
     // cluster id for persistent sub directory
     const std::string cluster_id_;
     // root filesystem directory for persistent storage
@@ -1054,8 +1206,15 @@ class MasterService {
     uint64_t snapshot_child_timeout_seconds_ =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     uint32_t snapshot_retention_count_ = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    std::unique_ptr<SerializerBackend> snapshot_backend_;
+    std::string snapshot_catalog_store_type_{};
+    std::string snapshot_catalog_store_connstring_;
+    std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
+    std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;
     mutable std::shared_mutex snapshot_mutex_;
+#ifdef STORE_USE_ETCD
+    mutable std::mutex snapshot_boundary_oplog_store_mutex_;
+    mutable std::unique_ptr<EtcdOpLogStore> snapshot_boundary_oplog_store_;
+#endif
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
@@ -1104,6 +1263,59 @@ class MasterService {
 
     // Task manager
     ClientTaskManager task_manager_;
+
+    struct ActiveDrainTask {
+        UUID task_id;
+        std::string key;
+        std::string source_segment;
+        std::string target_segment;
+        size_t bytes;
+        std::string unit_key;
+    };
+
+    struct DrainJob {
+        mutable std::mutex mutex;
+        UUID id;
+        JobType type{JobType::DRAIN};
+        JobStatus status{JobStatus::CREATED};
+        CreateDrainJobRequest request;
+        std::chrono::system_clock::time_point created_at;
+        std::chrono::system_clock::time_point last_updated_at;
+        std::string message;
+        uint64_t succeeded_units{0};
+        uint64_t failed_units{0};
+        uint64_t blocked_units{0};
+        uint64_t migrated_bytes{0};
+        std::unordered_map<UUID, ActiveDrainTask, boost::hash<UUID>>
+            active_tasks;
+        std::unordered_set<std::string> completed_unit_keys;
+        std::unordered_map<std::string, uint32_t> retry_counts;
+        std::unordered_set<std::string> terminal_failed_unit_keys;
+    };
+
+    static constexpr uint32_t kMaxDrainUnitRetries = 3;
+
+    tl::expected<void, ErrorCode> ValidateDrainRequest(
+        const CreateDrainJobRequest& request);
+    tl::expected<void, ErrorCode> ValidateDrainRequestLocked(
+        ScopedSegmentAccess& segment_access,
+        const CreateDrainJobRequest& request);
+    void ProcessDrainJobs();
+    void RefreshDrainJobTasks(DrainJob& job);
+    void ScheduleDrainJobTasks(DrainJob& job);
+    bool MaybeCompleteDrainJob(DrainJob& job);
+    std::optional<std::string> SelectDrainTargetForKey(
+        const ObjectMetadata& metadata, const std::string& source_segment,
+        const std::vector<std::string>& requested_targets);
+    std::string MakeDrainUnitKey(const std::string& key,
+                                 const std::string& source_segment) const;
+
+    std::thread job_dispatch_thread_;
+    std::atomic<bool> job_dispatch_running_{false};
+    static constexpr uint64_t kJobDispatchThreadSleepMs = 500;
+    std::mutex job_mutex_;
+    std::unordered_map<UUID, std::shared_ptr<DrainJob>, boost::hash<UUID>>
+        drain_jobs_ GUARDED_BY(job_mutex_);
 };
 
 }  // namespace mooncake

@@ -2,9 +2,12 @@
 
 #include <glog/logging.h>
 
+#include <boost/functional/hash.hpp>
+
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 #include <unordered_map>
@@ -84,6 +87,7 @@ inline std::ostream& operator<<(std::ostream& os,
 struct ReplicateConfig {
     size_t replica_num{1};
     bool with_soft_pin{false};
+    bool with_hard_pin{false};  // Hard pin: object cannot be evicted
     std::vector<std::string>
         preferred_segments{};         // Preferred segments for allocation
     std::string preferred_segment{};  // Deprecated: Single preferred segment
@@ -94,6 +98,7 @@ struct ReplicateConfig {
                                     const ReplicateConfig& config) noexcept {
         os << "ReplicateConfig: { replica_num: " << config.replica_num
            << ", with_soft_pin: " << config.with_soft_pin
+           << ", with_hard_pin: " << config.with_hard_pin
            << ", preferred_segments: [";
         for (size_t i = 0; i < config.preferred_segments.size(); ++i) {
             os << config.preferred_segments[i];
@@ -238,6 +243,12 @@ class Replica {
         return replica.is_processing();
     }
 
+    [[nodiscard]] bool is_busy() const { return refcnt_.load() > 0; }
+
+    [[nodiscard]] static bool fn_is_busy(const Replica& replica) {
+        return replica.is_busy();
+    }
+
     [[nodiscard]] ReplicaType type() const {
         return std::visit(ReplicaTypeVisitor{}, data_);
     }
@@ -274,6 +285,36 @@ class Replica {
         return false;  // DiskReplicaData does not have handles
     }
 
+    /**
+     * @brief Check if a local_disk replica's owner client is still alive.
+     * Used by CleanupStaleHandles to remove replicas belonging to expired
+     * clients. For non-local_disk replicas, always returns false.
+     * @param alive_clients Set of currently alive client IDs.
+     * @return true if this is a local_disk replica whose client is not alive.
+     */
+    [[nodiscard]] bool has_stale_local_disk_client(
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients)
+        const {
+        auto client_id = get_local_disk_client_id();
+        if (client_id.has_value()) {
+            return alive_clients.find(client_id.value()) == alive_clients.end();
+        }
+        return false;
+    }
+
+    /**
+     * @brief Get the client_id for local_disk replicas.
+     * @return The client_id if this is a local_disk replica, std::nullopt
+     * otherwise.
+     */
+    [[nodiscard]] std::optional<UUID> get_local_disk_client_id() const {
+        if (is_local_disk_replica()) {
+            const auto& disk_data = std::get<LocalDiskReplicaData>(data_);
+            return disk_data.client_id;
+        }
+        return std::nullopt;
+    }
+
     [[nodiscard]] size_t get_memory_buffer_size() const {
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);
@@ -294,6 +335,14 @@ class Replica {
             LOG(WARNING) << "Replica already marked as complete";
         } else {
             LOG(ERROR) << "Invalid replica status: " << status_;
+        }
+    }
+
+    void mark_processing() {
+        if (status_ == ReplicaStatus::COMPLETE) {
+            status_ = ReplicaStatus::PROCESSING;
+        } else {
+            LOG(ERROR) << "Cannot mark_processing from status: " << status_;
         }
     }
 

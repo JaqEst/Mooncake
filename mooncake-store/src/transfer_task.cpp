@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <sstream>
+#include <vector>
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
@@ -223,9 +225,13 @@ bool TransferEngineOperationState::is_completed() {
 }
 
 void TransferEngineOperationState::check_task_status() {
-    // Check all transfers in the batch
-    bool all_completed = true;
-    bool has_failure = false;
+    // Check all transfers in the batch.
+    // Wait for ALL tasks to reach a terminal state before setting the result,
+    // even if some have already failed. This prevents the caller from seeing
+    // "completed" while background transfers are still in progress, which
+    // could cause issues when freeBatchID is called in the destructor.
+    bool all_terminated = true;
+    std::vector<size_t> failed_task_ids;
 
     for (size_t i = 0; i < batch_size_; ++i) {
         TransferStatus status;
@@ -240,38 +246,45 @@ void TransferEngineOperationState::check_task_status() {
 
         switch (status.s) {
             case TransferStatusEnum::COMPLETED:
-                // This transfer is done, continue checking others
+                // This transfer is done successfully
                 break;
             case TransferStatusEnum::FAILED:
             case TransferStatusEnum::CANCELED:
             case TransferStatusEnum::INVALID:
 #ifndef USE_ASCEND_DIRECT
-                LOG(ERROR) << "Transfer failed for batch " << batch_id_
-                           << " task " << i << " with status "
-                           << static_cast<int>(status.s);
+                VLOG(1) << "Transfer failed for batch " << batch_id_ << " task "
+                        << i << " with status " << static_cast<int>(status.s);
 #endif
-                has_failure = true;
+                failed_task_ids.push_back(i);
                 break;
             default:
-                // Transfer is still pending (PENDING, RUNNING, etc.)
-                all_completed = false;
+                // Transfer is still in progress (WAITING, PENDING, etc.)
+                all_terminated = false;
                 break;
         }
     }
 
-    if (has_failure) {
-        VLOG(1) << "Setting batch " << batch_id_
-                << " result to TRANSFER_FAIL due to task failures";
-        set_result_internal(ErrorCode::TRANSFER_FAIL);
+    if (!all_terminated) {
+        // Some tasks are still in progress; wait for next poll iteration.
+        // Do NOT set result yet, even if some tasks have already failed.
         return;
     }
 
-    if (all_completed) {
-        set_result_internal(ErrorCode::OK);
-        return;
+    // All tasks have reached a terminal state.
+    ErrorCode ec = ErrorCode::OK;
+    if (!failed_task_ids.empty()) {
+        std::ostringstream oss;
+        for (size_t j = 0; j < failed_task_ids.size(); ++j) {
+            if (j > 0) oss << ", ";
+            oss << failed_task_ids[j];
+        }
+        LOG(ERROR) << "Batch " << batch_id_
+                   << " completed with task failures: task_ids=[" << oss.str()
+                   << "]";
+        ec = ErrorCode::TRANSFER_FAIL;
     }
 
-    return;
+    set_result_internal(ec);
 }
 
 void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
@@ -294,7 +307,8 @@ void TransferEngineOperationState::wait_for_completion() {
         return;
     }
 
-    constexpr int64_t timeout_seconds = 60;
+    // 60 seconds
+    constexpr int64_t timeout_milliseconds = 60 * 1000;
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
     VLOG(1) << "Waiting for transfer engine completion for batch " << batch_id_;
@@ -314,10 +328,18 @@ void TransferEngineOperationState::wait_for_completion() {
         // lock. Under the mutex, relaxed is sufficient; the mutex acquire
         // orders prior writes.
         std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
-        completed = batch_desc.completion_cv.wait_for(
-            lock, std::chrono::seconds(timeout_seconds), [&batch_desc] {
-                return batch_desc.is_finished.load(std::memory_order_relaxed);
-            });
+        const int64_t elapsed_milliseconds =
+            getCurrentTimeInMilli() - start_ts_;
+        if (elapsed_milliseconds < timeout_milliseconds) {
+            completed = batch_desc.completion_cv.wait_for(
+                lock,
+                std::chrono::milliseconds(timeout_milliseconds -
+                                          elapsed_milliseconds),
+                [&batch_desc] {
+                    return batch_desc.is_finished.load(
+                        std::memory_order_relaxed);
+                });
+        }
     }  // Explicitly release completion_mutex before acquiring mutex_
 
     // Once completion is observed, read failure flag.
@@ -338,20 +360,18 @@ void TransferEngineOperationState::wait_for_completion() {
         VLOG(1) << "Transfer engine operation completed for batch " << batch_id_
                 << " with result: " << static_cast<int>(error_code);
     } else {
-        LOG(ERROR) << "Failed to complete transfers after " << timeout_seconds
-                   << " seconds for batch " << batch_id_;
+        LOG(ERROR) << "Failed to complete transfers after "
+                   << timeout_milliseconds << " milliseconds for batch "
+                   << batch_id_;
     }
 #else
     VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
 
-    constexpr int64_t kOneSecondInNano = 1000 * 1000 * 1000;
-    const int64_t start_ts = getCurrentTimeInNano();
-
     while (true) {
-        if (getCurrentTimeInNano() - start_ts >
-            timeout_seconds * kOneSecondInNano) {
+        if (getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
             LOG(ERROR) << "Failed to complete transfers after "
-                       << timeout_seconds << " seconds for batch " << batch_id_;
+                       << timeout_milliseconds << " milliseconds for batch "
+                       << batch_id_;
             set_result_internal(ErrorCode::TRANSFER_FAIL);
             return;
         }
@@ -409,10 +429,17 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
       transfer_metric_(transfer_metric) {
-    // Read MC_STORE_MEMCPY environment variable, default to false (disabled)
+    // Read MC_STORE_MEMCPY environment variable.
+    // When not set, auto-detect based on transport type:
+    //   - TCP-only environment: enable memcpy (avoids TCP loopback overhead)
+    //   - RDMA/other transports: disable memcpy (RDMA is more efficient)
     const char* env_value = std::getenv("MC_STORE_MEMCPY");
     if (env_value == nullptr) {
-        memcpy_enabled_ = false;  // Default: disabled
+        memcpy_enabled_ = engine_.isTcpOnly();
+        LOG(INFO) << "MC_STORE_MEMCPY not set, auto-detected: "
+                  << (memcpy_enabled_ ? "TCP-only environment, memcpy enabled"
+                                      : "non-TCP transport available, memcpy "
+                                        "disabled");
     } else {
         std::string env_str(env_value);
         // Convert to lowercase for case-insensitive comparison
@@ -448,18 +475,23 @@ std::optional<TransferFuture> TransferSubmitter::submit(
             return std::nullopt;
         }
 
-        TransferStrategy strategy = selectStrategy(handle, slices);
+        if (op_code == TransferRequest::READ) {
+            future = submitMemoryReadOperation(handle, slices, 0);
+        } else {
+            TransferStrategy strategy = selectStrategy(handle, slices);
 
-        switch (strategy) {
-            case TransferStrategy::LOCAL_MEMCPY:
-                future = submitMemcpyOperation(handle, slices, op_code);
-                break;
-            case TransferStrategy::TRANSFER_ENGINE:
-                future = submitTransferEngineOperation(handle, slices, op_code);
-                break;
-            default:
-                LOG(ERROR) << "Unknown transfer strategy: " << strategy;
-                return std::nullopt;
+            switch (strategy) {
+                case TransferStrategy::LOCAL_MEMCPY:
+                    future = submitMemcpyOperation(handle, slices, op_code);
+                    break;
+                case TransferStrategy::TRANSFER_ENGINE:
+                    future =
+                        submitTransferEngineOperation(handle, slices, op_code);
+                    break;
+                default:
+                    LOG(ERROR) << "Unknown transfer strategy: " << strategy;
+                    return std::nullopt;
+            }
         }
     } else {
         future = submitFileReadOperation(replica, slices, op_code);
@@ -544,14 +576,14 @@ TransferSubmitter::submit_batch_get_offload_object(
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code) {
+    const TransferRequest::OpCode op_code, uint64_t src_offset) {
     auto state = std::make_shared<MemcpyOperationState>();
 
     // Create memcpy operations
     std::vector<MemcpyOperation> operations;
     operations.reserve(slices.size());
     uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
-    uint64_t offset = 0;
+    uint64_t offset = src_offset;
 
     for (size_t i = 0; i < slices.size(); ++i) {
         const auto& slice = slices[i];
@@ -562,13 +594,11 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
         const void* src;
 
         if (op_code == TransferRequest::READ) {
-            // READ: from handle (remote buffer) to slice (local
-            // buffer)
+            // READ: from handle (remote buffer) to slice (local buffer)
             dest = slice.ptr;
             src = reinterpret_cast<const void*>(base_address + offset);
         } else {
-            // WRITE: from slice (local buffer) to handle (remote
-            // buffer)
+            // WRITE: from slice (local buffer) to handle (remote buffer)
             dest = reinterpret_cast<void*>(base_address + offset);
             src = slice.ptr;
         }
@@ -624,7 +654,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code) {
+    const TransferRequest::OpCode op_code, uint64_t src_offset) {
     if (handle.transport_endpoint_.empty()) {
         LOG(ERROR) << "Transport endpoint is empty for handle with address "
                    << handle.buffer_address_;
@@ -642,7 +672,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     std::vector<TransferRequest> requests;
     requests.reserve(slices.size());
     uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
-    uint64_t offset = 0;
+    uint64_t offset = src_offset;
 
     for (size_t i = 0; i < slices.size(); ++i) {
         const auto& slice = slices[i];
@@ -659,6 +689,57 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         requests.emplace_back(request);
     }
     return submitTransfer(requests);
+}
+
+std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
+    const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
+    uint64_t src_offset) {
+    TransferStrategy strategy = selectStrategy(handle, slices);
+
+    if (strategy == TransferStrategy::LOCAL_MEMCPY) {
+        return submitMemcpyOperation(handle, slices, TransferRequest::READ,
+                                     src_offset);
+    }
+    if (strategy == TransferStrategy::TRANSFER_ENGINE) {
+        return submitTransferEngineOperation(handle, slices,
+                                             TransferRequest::READ, src_offset);
+    }
+
+    LOG(ERROR) << "Read only supports LOCAL_MEMCPY or TRANSFER_ENGINE, got: "
+               << strategy;
+    return std::nullopt;
+}
+
+std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
+    const Replica::Descriptor& replica, std::vector<Slice>& slices,
+    uint64_t src_offset) {
+    std::optional<TransferFuture> future;
+
+    if (replica.is_memory_replica()) {
+        auto& mem_desc = replica.get_memory_descriptor();
+        auto& handle = mem_desc.buffer_descriptor;
+
+        size_t slices_size = 0;
+        for (const auto& s : slices) slices_size += s.size;
+        if (src_offset + slices_size > handle.size_) {
+            LOG(ERROR) << "Range read overflow: src_offset=" << src_offset
+                       << " + slices_size=" << slices_size
+                       << " > handle.size_=" << handle.size_;
+            return std::nullopt;
+        }
+
+        future = submitMemoryReadOperation(handle, slices, src_offset);
+    } else if (replica.is_disk_replica() || replica.is_local_disk_replica()) {
+        LOG(ERROR)
+            << "Range read not supported for disk replicas (use full read)";
+        return std::nullopt;
+    }
+
+    if (future.has_value()) {
+        updateTransferMetrics(slices, TransferRequest::READ);
+    }
+
+    return future;
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(

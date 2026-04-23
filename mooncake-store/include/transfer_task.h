@@ -174,7 +174,10 @@ class TransferEngineOperationState : public OperationState {
    public:
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
                                  size_t batch_size)
-        : engine_(engine), batch_id_(batch_id), batch_size_(batch_size) {}
+        : engine_(engine),
+          batch_id_(batch_id),
+          batch_size_(batch_size),
+          start_ts_(getCurrentTimeInMilli()) {}
 
     ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
 
@@ -199,6 +202,7 @@ class TransferEngineOperationState : public OperationState {
     TransferEngine& engine_;
     BatchID batch_id_;
     size_t batch_size_;
+    const int64_t start_ts_;
 };
 
 /**
@@ -385,6 +389,14 @@ class TransferSubmitter {
                                          std::vector<Slice>& slices,
                                          TransferRequest::OpCode op_code);
 
+    /**
+     * @brief Submit a range read: read [src_offset, src_offset+size) from
+     * object into slice.ptr. Slices must total exactly `size` bytes.
+     */
+    std::optional<TransferFuture> submitRangeRead(
+        const Replica::Descriptor& replica, std::vector<Slice>& slices,
+        uint64_t src_offset);
+
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
@@ -425,16 +437,21 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submitMemcpyOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices,
-        const TransferRequest::OpCode op_code);
+        const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
+        uint64_t src_offset = 0);
 
     /**
      * @brief Submit transfer engine operation asynchronously
+     * @param src_offset Optional offset in source buffer (default 0)
      */
     std::optional<TransferFuture> submitTransferEngineOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices,
-        const TransferRequest::OpCode op_code);
+        const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
+        uint64_t src_offset = 0);
+
+    std::optional<TransferFuture> submitMemoryReadOperation(
+        const AllocatedBuffer::Descriptor& handle,
+        const std::vector<Slice>& slices, uint64_t src_offset);
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,

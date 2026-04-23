@@ -21,14 +21,19 @@
 #include "transfer_task.h"
 #include "transport/transport.h"
 #include "config.h"
-#include "ha/ha_backend_factory.h"
+#include "ha/leadership/leader_coordinator_factory.h"
 #include "types.h"
 #include "client_buffer.hpp"
 #include "utils.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
+#include "gpu_staging_utils.h"
 
 namespace mooncake {
+
+using gpu_staging::CopyDeviceToHost;
+using gpu_staging::IsDevicePointer;
+using gpu_staging::SetDevice;
 
 [[nodiscard]] size_t CalculateSliceSize(const std::vector<Slice>& slices) {
     size_t slice_size = 0;
@@ -57,6 +62,7 @@ Client::Client(const std::string& local_hostname,
       local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
+      pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       write_thread_pool_(2),
       task_thread_pool_(4) {
     LOG(INFO) << "client_id=" << client_id_;
@@ -77,6 +83,21 @@ Client::Client(const std::string& local_hostname,
 }
 
 Client::~Client() {
+    task_poll_running_ = false;
+    if (task_poll_thread_.joinable()) {
+        task_poll_thread_.join();
+    }
+
+    storage_heartbeat_running_ = false;
+    if (storage_heartbeat_thread_.joinable()) {
+        storage_heartbeat_thread_.join();
+    }
+
+    leader_monitor_running_ = false;
+    if (leader_monitor_thread_.joinable()) {
+        leader_monitor_thread_.join();
+    }
+
     // Make a copy of mounted_segments_ to avoid modifying while iterating
     std::vector<Segment> segments_to_unmount;
     {
@@ -106,17 +127,9 @@ Client::~Client() {
     hot_cache_handler_.reset();
     hot_cache_.reset();
 
-    // Stop task thread pool before stopping ping thread
+    // Stop task thread pool after task polling has stopped.
     task_running_ = false;
     task_thread_pool_.stop();
-
-    // Stop ping thread only after no need to contact master anymore
-    if (ping_running_) {
-        ping_running_ = false;
-        if (ping_thread_.joinable()) {
-            ping_thread_.join();
-        }
-    }
 }
 
 static std::optional<bool> get_auto_discover() {
@@ -244,36 +257,107 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
         }
 
         const auto& master_view = current_view.value().value();
-        auto err = master_client_.Connect(master_view.leader_address);
+        auto err = SwitchLeader(master_view);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to connect to master";
             return err;
         }
 
         leader_coordinator_ = std::move(coordinator.value());
+        direct_master_address_.clear();
 
-        // Start ping thread to monitor master health and trigger remount if
-        // needed.
-        ping_running_ = true;
-        std::string current_master_address = master_view.leader_address;
-        ping_thread_ = std::thread([this, current_master_address]() mutable {
-            this->PingThreadMain(std::move(current_master_address));
-        });
+        leader_monitor_running_ = true;
+        leader_monitor_thread_ =
+            std::thread([this]() { this->LeaderMonitorThreadMain(); });
 
         return ErrorCode::OK;
     } else {
-        leader_coordinator_.reset();
         auto err = master_client_.Connect(master_server_entry);
         if (err != ErrorCode::OK) {
             return err;
         }
-        // Non-HA mode also enables heartbeat/ping
-        ping_running_ = true;
-        std::string current_master_address = master_server_entry;
-        ping_thread_ = std::thread([this, current_master_address]() mutable {
-            this->PingThreadMain(std::move(current_master_address));
-        });
+        direct_master_address_ = master_server_entry;
+        {
+            std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+            current_master_view_.reset();
+        }
+        last_ping_success_.store(true);
         return ErrorCode::OK;
+    }
+}
+
+ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {
+    std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+
+    if (current_master_view_.has_value()) {
+        const auto& current_view = current_master_view_.value();
+        if (target_view.view_version < current_view.view_version) {
+            return ErrorCode::OK;
+        }
+
+        if (target_view.view_version == current_view.view_version &&
+            target_view.leader_address == current_view.leader_address &&
+            last_ping_success_.load()) {
+            return ErrorCode::OK;
+        }
+    }
+
+    auto err = master_client_.Connect(target_view.leader_address);
+    if (err != ErrorCode::OK) {
+        last_ping_success_.store(false);
+        return err;
+    }
+
+    current_master_view_ = target_view;
+    last_ping_success_.store(true);
+    return ErrorCode::OK;
+}
+
+void Client::LeaderMonitorThreadMain() {
+    constexpr auto kViewChangeTimeout = std::chrono::milliseconds(1000);
+    constexpr auto kErrorRetryInterval = std::chrono::milliseconds(1000);
+
+    while (leader_monitor_running_.load()) {
+        std::optional<ViewVersionId> known_version;
+        {
+            std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+            if (current_master_view_.has_value()) {
+                known_version = current_master_view_->view_version;
+            }
+        }
+
+        auto view_change = leader_coordinator_->WaitForViewChange(
+            known_version, kViewChangeTimeout);
+        if (!view_change) {
+            LOG(WARNING) << "Failed to wait for leader view change: "
+                         << toString(view_change.error());
+            std::this_thread::sleep_for(kErrorRetryInterval);
+            continue;
+        }
+
+        if (!view_change->changed || !view_change->current_view.has_value()) {
+            continue;
+        }
+
+        auto err = SwitchLeader(view_change->current_view.value());
+        if (err != ErrorCode::OK) {
+            LOG(WARNING) << "Failed to switch to leader "
+                         << view_change->current_view->leader_address << ": "
+                         << toString(err);
+            std::this_thread::sleep_for(kErrorRetryInterval);
+        }
+    }
+}
+
+void Client::EnsureStorageControlPlaneStarted() {
+    if (!storage_heartbeat_running_.exchange(true)) {
+        storage_heartbeat_thread_ =
+            std::thread([this]() { this->StorageHeartbeatThreadMain(); });
+    }
+
+    if (!task_poll_running_.exchange(true)) {
+        task_poll_thread_ =
+            std::thread([this]() { this->TaskPollThreadMain(); });
     }
 }
 
@@ -742,6 +826,45 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
+                                          const QueryResult& query_result,
+                                          std::vector<Slice>& slices,
+                                          uint64_t src_offset) {
+    Replica::Descriptor replica;
+    ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
+    if (err != ErrorCode::OK) {
+        if (err == ErrorCode::INVALID_REPLICA) {
+            LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
+        }
+        return tl::unexpected(err);
+    }
+    if (!replica.is_memory_replica()) {
+        LOG(ERROR) << "Range read only supported for memory replicas, key="
+                   << object_key;
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+
+    auto t0_get = std::chrono::steady_clock::now();
+    err = TransferReadRange(replica, slices, src_offset);
+    auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - t0_get)
+                      .count();
+    if (metrics_) {
+        metrics_->transfer_metric.get_latency_us.observe(us_get);
+    }
+
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "transfer_read_range_failed key=" << object_key;
+        return tl::unexpected(err);
+    }
+    if (query_result.IsLeaseExpired()) {
+        LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
+                     << object_key;
+        return tl::unexpected(ErrorCode::LEASE_EXPIRED);
+    }
+    return {};
+}
+
 struct BatchGetOperation {
     std::vector<Replica::Descriptor> replicas;
     std::vector<std::vector<Slice>> batched_slices;
@@ -1132,6 +1255,116 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
+                                             std::vector<Slice>& slices,
+                                             const ReplicateConfig& config) {
+    // Prepare slice lengths
+    std::vector<size_t> slice_lengths;
+    for (size_t i = 0; i < slices.size(); ++i) {
+        slice_lengths.emplace_back(slices[i].size);
+    }
+
+    ReplicateConfig client_cfg = config;
+    if (protocol_ == "cxl") {
+        client_cfg.preferred_segment = local_hostname_;
+    }
+
+    // Start upsert operation
+    auto start_result =
+        master_client_.UpsertStart(key, slice_lengths, client_cfg);
+    if (!start_result) {
+        ErrorCode err = start_result.error();
+        if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
+            LOG(WARNING) << "Failed to start upsert operation for key=" << key
+                         << PUT_NO_SPACE_HELPER_STR;
+        } else {
+            LOG(ERROR) << "Failed to start upsert operation for key=" << key
+                       << ": " << toString(err);
+        }
+        return tl::unexpected(err);
+    }
+
+    // Record transfer latency
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Handle disk replicas first
+    if (storage_backend_) {
+        for (auto it = start_result.value().rbegin();
+             it != start_result.value().rend(); ++it) {
+            const auto& replica = *it;
+            if (replica.is_disk_replica()) {
+                auto disk_descriptor = replica.get_disk_descriptor();
+                PutToLocalFile(key, slices, disk_descriptor);
+                break;
+            }
+        }
+    }
+
+    // Transfer to memory replicas
+    for (const auto& replica : start_result.value()) {
+        if (replica.is_memory_replica()) {
+            ErrorCode transfer_err = TransferWrite(replica, slices);
+            if (transfer_err != ErrorCode::OK) {
+                auto revoke_result =
+                    master_client_.UpsertRevoke(key, ReplicaType::MEMORY);
+                if (!revoke_result) {
+                    LOG(ERROR) << "Failed to revoke upsert operation";
+                    return tl::unexpected(revoke_result.error());
+                }
+                return tl::unexpected(transfer_err);
+            }
+        }
+    }
+
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+    if (metrics_) {
+        metrics_->transfer_metric.put_latency_us.observe(us);
+    }
+
+    // End upsert operation
+    auto end_result = master_client_.UpsertEnd(key, ReplicaType::MEMORY);
+    if (!end_result) {
+        ErrorCode err = end_result.error();
+        LOG(ERROR) << "Failed to end upsert operation: " << err;
+        return tl::unexpected(err);
+    }
+
+    return {};
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config) {
+    ReplicateConfig client_cfg = config;
+    if (protocol_ == "cxl") {
+        client_cfg.preferred_segment = local_hostname_;
+    }
+    if (client_cfg.prefer_alloc_in_same_node) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported for upsert";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
+    StartBatchUpsert(ops, client_cfg);
+
+    auto t0 = std::chrono::steady_clock::now();
+    SubmitTransfers(ops);
+    WaitForTransfers(ops);
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+    if (metrics_) {
+        metrics_->transfer_metric.batch_put_latency_us.observe(us);
+    }
+
+    FinalizeBatchUpsert(ops);
+    return CollectResults(ops);
+}
+
 // TODO: `client.cpp` is too long, consider split it into multiple files
 enum class PutOperationState {
     PENDING,
@@ -1249,6 +1482,52 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
             // Operation continues to next stage - result remains INTERNAL_ERROR
             // until fully successful
             VLOG(1) << "Successfully started put for key " << ops[i].key
+                    << " with " << ops[i].replicas.size() << " replicas";
+        }
+    }
+}
+
+void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
+                              const ReplicateConfig& config) {
+    std::vector<std::string> keys;
+    std::vector<std::vector<uint64_t>> slice_lengths;
+
+    keys.reserve(ops.size());
+    slice_lengths.reserve(ops.size());
+
+    for (const auto& op : ops) {
+        keys.emplace_back(op.key);
+
+        std::vector<uint64_t> slice_sizes;
+        slice_sizes.reserve(op.slices.size());
+        for (const auto& slice : op.slices) {
+            slice_sizes.emplace_back(slice.size);
+        }
+        slice_lengths.emplace_back(std::move(slice_sizes));
+    }
+
+    auto start_responses =
+        master_client_.BatchUpsertStart(keys, slice_lengths, config);
+
+    // Ensure response size matches request size
+    if (start_responses.size() != ops.size()) {
+        LOG(ERROR) << "BatchUpsertStart response size mismatch: expected "
+                   << ops.size() << ", got " << start_responses.size();
+        for (auto& op : ops) {
+            op.SetError(ErrorCode::RPC_FAIL,
+                        "BatchUpsertStart response size mismatch");
+        }
+        return;
+    }
+
+    // Process individual responses with robust error handling
+    for (size_t i = 0; i < ops.size(); ++i) {
+        if (!start_responses[i]) {
+            ops[i].SetError(start_responses[i].error(),
+                            "Master failed to start upsert operation");
+        } else {
+            ops[i].replicas = start_responses[i].value();
+            VLOG(1) << "Successfully started upsert for key " << ops[i].key
                     << " with " << ops[i].replicas.size() << " replicas";
         }
     }
@@ -1483,6 +1762,101 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     }
 }
 
+void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
+    std::vector<std::string> successful_keys;
+    std::vector<size_t> successful_indices;
+    std::vector<std::string> failed_keys;
+    std::vector<size_t> failed_indices;
+
+    successful_keys.reserve(ops.size());
+    successful_indices.reserve(ops.size());
+    failed_keys.reserve(ops.size());
+    failed_indices.reserve(ops.size());
+
+    for (size_t i = 0; i < ops.size(); ++i) {
+        auto& op = ops[i];
+
+        if (!op.IsResolved() && !op.replicas.empty() &&
+            !op.pending_transfers.empty()) {
+            successful_keys.emplace_back(op.key);
+            successful_indices.emplace_back(i);
+        } else if (op.state != PutOperationState::PENDING &&
+                   !op.replicas.empty()) {
+            failed_keys.emplace_back(op.key);
+            failed_indices.emplace_back(i);
+        }
+    }
+
+    // Process successful operations
+    if (!successful_keys.empty()) {
+        auto end_responses = master_client_.BatchUpsertEnd(successful_keys);
+        if (end_responses.size() != successful_keys.size()) {
+            LOG(ERROR) << "BatchUpsertEnd response size mismatch: expected "
+                       << successful_keys.size() << ", got "
+                       << end_responses.size();
+            for (size_t idx : successful_indices) {
+                ops[idx].SetError(ErrorCode::RPC_FAIL,
+                                  "BatchUpsertEnd response size mismatch");
+            }
+        } else {
+            for (size_t i = 0; i < end_responses.size(); ++i) {
+                const size_t op_idx = successful_indices[i];
+                if (!end_responses[i]) {
+                    LOG(ERROR) << "Failed to finalize upsert for key "
+                               << successful_keys[i] << ": "
+                               << toString(end_responses[i].error());
+                    ops[op_idx].SetError(end_responses[i].error(),
+                                         "BatchUpsertEnd failed");
+                } else {
+                    ops[op_idx].SetSuccess();
+                    VLOG(1) << "Successfully completed upsert for key "
+                            << successful_keys[i];
+                }
+            }
+        }
+    }
+
+    // Process failed operations that need cleanup
+    if (!failed_keys.empty()) {
+        auto revoke_responses = master_client_.BatchUpsertRevoke(failed_keys);
+        if (revoke_responses.size() != failed_keys.size()) {
+            LOG(ERROR) << "BatchUpsertRevoke response size mismatch: expected "
+                       << failed_keys.size() << ", got "
+                       << revoke_responses.size();
+            for (size_t idx : failed_indices) {
+                ops[idx].SetError(ErrorCode::RPC_FAIL,
+                                  "BatchUpsertRevoke response size mismatch");
+            }
+        } else {
+            for (size_t i = 0; i < revoke_responses.size(); ++i) {
+                const size_t op_idx = failed_indices[i];
+                if (!revoke_responses[i]) {
+                    LOG(ERROR)
+                        << "Failed to revoke upsert for key " << failed_keys[i]
+                        << ": " << toString(revoke_responses[i].error());
+                    std::string original_context =
+                        ops[op_idx].failure_context.value_or("unknown error");
+                    ops[op_idx].failure_context =
+                        original_context + "; revoke also failed";
+                } else {
+                    LOG(INFO) << "Successfully revoked failed upsert for key "
+                              << failed_keys[i];
+                }
+            }
+        }
+    }
+
+    // Ensure all operations have definitive results
+    for (auto& op : ops) {
+        if (!op.IsResolved()) {
+            op.SetError(ErrorCode::INTERNAL_ERROR,
+                        "Operation not resolved after finalization");
+            LOG(ERROR) << "Operation for key " << op.key
+                       << " was not properly resolved";
+        }
+    }
+}
+
 std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     const std::vector<PutOperation>& ops) {
     std::vector<tl::expected<void, ErrorCode>> results;
@@ -1495,7 +1869,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
 
         // Additional validation and logging for debugging
         if (!op.result.has_value()) {
-            // if error == object already exist, consider as ok
+            // If error == object already exist, consider as ok (Put semantics).
+            // UpsertStart never returns this error, so this branch is
+            // unreachable for BatchUpsert — kept for BatchPut compatibility.
             if (op.result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
                 results.back() = {};
                 continue;
@@ -1677,6 +2053,11 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     return master_client_.RemoveAll(force);
 }
 
+std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
+    const std::vector<ObjectKey>& keys, bool force) {
+    return master_client_.BatchRemove(keys, force);
+}
+
 tl::expected<void, ErrorCode> Client::EvictDiskReplica(
     const std::string& key, ReplicaType replica_type) {
     return master_client_.EvictDiskReplica(key, replica_type);
@@ -1708,56 +2089,61 @@ tl::expected<void, ErrorCode> Client::MountSegment(
         return tl::unexpected(check_result.error());
     }
 
-    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
 
-    // Check if the segment overlaps with any existing segment
-    for (auto& it : mounted_segments_) {
-        auto& mtseg = it.second;
-        uintptr_t l1 = reinterpret_cast<uintptr_t>(mtseg.base);
-        uintptr_t r1 = reinterpret_cast<uintptr_t>(mtseg.size) + l1;
-        uintptr_t l2 = reinterpret_cast<uintptr_t>(buffer);
-        uintptr_t r2 = reinterpret_cast<uintptr_t>(size) + l2;
-        if (std::max(l1, l2) < std::min(r1, r2)) {
-            LOG(ERROR) << "segment_overlaps base1=" << mtseg.base
-                       << " size1=" << mtseg.size << " base2=" << buffer
-                       << " size2=" << size;
+        // Check if the segment overlaps with any existing segment
+        for (auto& it : mounted_segments_) {
+            auto& mtseg = it.second;
+            uintptr_t l1 = reinterpret_cast<uintptr_t>(mtseg.base);
+            uintptr_t r1 = reinterpret_cast<uintptr_t>(mtseg.size) + l1;
+            uintptr_t l2 = reinterpret_cast<uintptr_t>(buffer);
+            uintptr_t r2 = reinterpret_cast<uintptr_t>(size) + l2;
+            if (std::max(l1, l2) < std::min(r1, r2)) {
+                LOG(ERROR) << "segment_overlaps base1=" << mtseg.base
+                           << " size1=" << mtseg.size << " base2=" << buffer
+                           << " size2=" << size;
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
+
+        int rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
+                                                       location, true, true);
+        if (rc != 0) {
+            LOG(ERROR) << "register_local_memory_failed base=" << buffer
+                       << " size=" << size << ", error=" << rc;
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
+
+        // Build segment with logical name; attach TE endpoint for transport
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.name = local_hostname_;
+        segment.base = reinterpret_cast<uintptr_t>(buffer);
+        segment.size = size;
+        segment.protocol = protocol;
+        // For P2P handshake mode, publish the actual transport endpoint that
+        // was negotiated by the transfer engine. Otherwise, keep the logical
+        // hostname so metadata backends (HTTP/etcd/redis) can resolve the
+        // segment by name.
+        if (metadata_connstring_ == P2PHANDSHAKE) {
+            segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
+        } else {
+            segment.te_endpoint = local_hostname_;
+        }
+
+        auto mount_result = master_client_.MountSegment(segment);
+        if (!mount_result) {
+            ErrorCode err = mount_result.error();
+            LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
+                       << " size=" << size << ", error=" << err;
+            return tl::unexpected(err);
+        }
+
+        mounted_segments_[segment.id] = segment;
     }
 
-    int rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
-                                                   location, true, true);
-    if (rc != 0) {
-        LOG(ERROR) << "register_local_memory_failed base=" << buffer
-                   << " size=" << size << ", error=" << rc;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    // Build segment with logical name; attach TE endpoint for transport
-    Segment segment;
-    segment.id = generate_uuid();
-    segment.name = local_hostname_;
-    segment.base = reinterpret_cast<uintptr_t>(buffer);
-    segment.size = size;
-    segment.protocol = protocol;
-    // For P2P handshake mode, publish the actual transport endpoint that was
-    // negotiated by the transfer engine. Otherwise, keep the logical hostname
-    // so metadata backends (HTTP/etcd/redis) can resolve the segment by name.
-    if (metadata_connstring_ == P2PHANDSHAKE) {
-        segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
-    } else {
-        segment.te_endpoint = local_hostname_;
-    }
-
-    auto mount_result = master_client_.MountSegment(segment);
-    if (!mount_result) {
-        ErrorCode err = mount_result.error();
-        LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
-                   << " size=" << size << ", error=" << err;
-        return tl::unexpected(err);
-    }
-
-    mounted_segments_[segment.id] = segment;
+    EnsureStorageControlPlaneStarted();
     return {};
 }
 
@@ -1864,7 +2250,10 @@ tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
     if (!response) {
         LOG(ERROR) << "MountLocalDiskSegment failed, error code is "
                    << response.error();
+        return response;
     }
+
+    EnsureStorageControlPlaneStarted();
     return response;
 }
 
@@ -2112,19 +2501,34 @@ void Client::PutToLocalFile(const std::string& key,
     }
 
     std::string path = disk_descriptor.file_path;
-    // Currently, persistence is achieved through asynchronous writes, but
-    // before asynchronous writing in 3FS, significant performance degradation
-    // may occur due to data copying. Profiling reveals that the number of page
-    // faults triggered in this scenario is nearly double the normal count.
-    // Future plans include introducing a reuse buffer list to address this
-    // performance degradation issue.
 
+    // Synchronous D2H staging + copy into std::string.
+    // Done on the calling thread to guarantee GPU buffers are still valid
+    // (BatchPut has not yet returned to Python, so blocks are not reused).
     std::string value;
     value.reserve(total_size);
+
     for (const auto& slice : slices) {
-        value.append(static_cast<char*>(slice.ptr), slice.size);
+        int device_id = -1;
+        if (IsDevicePointer(slice.ptr, &device_id)) {
+            SetDevice(device_id);
+            auto buf = pinned_buffer_pool_->Acquire(slice.size);
+            if (!CopyDeviceToHost(buf.data, slice.ptr, slice.size)) {
+                LOG(ERROR) << "D2H copy failed for key: " << key
+                           << ", triggering PutRevoke for disk replica";
+                pinned_buffer_pool_->Release(buf);
+                // Must revoke to avoid phantom replica in master
+                master_client_.PutRevoke(key, ReplicaType::DISK);
+                return;
+            }
+            value.append(buf.data, slice.size);
+            pinned_buffer_pool_->Release(buf);
+        } else {
+            value.append(static_cast<char*>(slice.ptr), slice.size);
+        }
     }
 
+    // Async StoreObject + PutEnd (unchanged from original)
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
                                 value = std::move(value), path] {
         // Store the object
@@ -2184,6 +2588,26 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     return future->get();
 }
 
+ErrorCode Client::TransferReadInternal(
+    const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
+    uint64_t src_offset) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    auto future = transfer_submitter_->submitRangeRead(replica_descriptor,
+                                                       slices, src_offset);
+    if (!future) {
+        LOG(ERROR) << "Failed to submit range read operation";
+        return ErrorCode::TRANSFER_FAIL;
+    }
+
+    VLOG(1) << "Using transfer strategy: " << future->strategy();
+
+    return future->get();
+}
+
 ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices) {
     return TransferData(replica_descriptor, slices, TransferRequest::WRITE);
@@ -2210,6 +2634,12 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     return TransferData(replica_descriptor, slices, TransferRequest::READ);
 }
 
+ErrorCode Client::TransferReadRange(
+    const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
+    uint64_t src_offset) {
+    return TransferReadInternal(replica_descriptor, slices, src_offset);
+}
+
 void Client::PollAndDispatchTasks() {
     if (task_running_.load()) {
         auto fetch_result = FetchTasks(kTaskBatchSize);
@@ -2231,6 +2661,15 @@ void Client::PollAndDispatchTasks() {
                     << "action=task_poll_failed" << ", error_code=" << error;
             }
         }
+    }
+}
+
+void Client::TaskPollThreadMain() {
+    const auto poll_interval = std::chrono::milliseconds(1000);
+
+    while (task_poll_running_.load()) {
+        PollAndDispatchTasks();
+        std::this_thread::sleep_for(poll_interval);
     }
 }
 
@@ -2357,7 +2796,7 @@ void Client::ExecuteTask(const ClientTask& client_task) {
     }
 }
 
-void Client::PingThreadMain(std::string current_master_address) {
+void Client::StorageHeartbeatThreadMain() {
     // How many failed pings before reconnecting via the HA coordinator
     const int max_ping_fail_count = 3;
     // How long to wait for next ping after success
@@ -2388,7 +2827,7 @@ void Client::PingThreadMain(std::string current_master_address) {
     // thread
     std::future<void> remount_segment_future;
 
-    while (ping_running_) {
+    while (storage_heartbeat_running_.load()) {
         // Join the remount segment thread if it is ready
         if (remount_segment_future.valid() &&
             remount_segment_future.wait_for(std::chrono::seconds(0)) ==
@@ -2409,9 +2848,6 @@ void Client::PingThreadMain(std::string current_master_address) {
                 remount_segment_future =
                     std::async(std::launch::async, remount_segment);
             }
-
-            // Poll for tasks and dispatch to task thread pool
-            PollAndDispatchTasks();
 
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(success_ping_interval_ms));
@@ -2448,7 +2884,7 @@ void Client::PingThreadMain(std::string current_master_address) {
             }
 
             const auto& next_view = current_view.value().value();
-            auto err = master_client_.Connect(next_view.leader_address);
+            auto err = SwitchLeader(next_view);
             if (err != ErrorCode::OK) {
                 LOG(ERROR) << "Failed to connect to master "
                            << next_view.leader_address << ": " << toString(err);
@@ -2457,10 +2893,10 @@ void Client::PingThreadMain(std::string current_master_address) {
                 continue;
             }
 
-            current_master_address = next_view.leader_address;
             LOG(INFO) << "Reconnected to master " << next_view.leader_address;
             ping_fail_count = 0;
         } else {
+            const std::string current_master_address = direct_master_address_;
             LOG(ERROR) << "Failed to ping master for " << ping_fail_count
                        << " times (non-HA); reconnecting to "
                        << current_master_address;
@@ -2473,6 +2909,7 @@ void Client::PingThreadMain(std::string current_master_address) {
                 continue;
             }
             LOG(INFO) << "Reconnected to master " << current_master_address;
+            last_ping_success_.store(true);
             ping_fail_count = 0;
         }
     }

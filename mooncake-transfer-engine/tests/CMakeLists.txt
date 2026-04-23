@@ -9,7 +9,7 @@ if (USE_HIP)
 endif()
 
 add_executable(rdma_transport_test ${WORKSPACE}/rdma_transport_test.cpp)
-target_link_libraries(rdma_transport_test PUBLIC transfer_engine)
+target_link_libraries(rdma_transport_test PUBLIC transfer_engine gflags::gflags glog::glog)
 # add_test(NAME rdma_transport_test COMMAND rdma_transport_test)
 
 add_executable(transport_uint_test ${WORKSPACE}/transport_uint_test.cpp)
@@ -23,6 +23,11 @@ target_link_libraries(rdma_transport_test2 PUBLIC transfer_engine gtest gtest_ma
 add_executable(rdma_loopback_test ${WORKSPACE}/rdma_loopback_test.cpp)
 target_link_libraries(rdma_loopback_test PUBLIC transfer_engine gtest gtest_main )
 # add_test(NAME rdma_loopback_test COMMAND rdma_loopback_test)
+
+# This test verifies endpoint re-establishment in RDMATransport.
+# Intended for manual testing only.
+add_executable(rdma_endpoint_reestablish_test ${WORKSPACE}/rdma_endpoint_reestablish_test.cpp)
+target_link_libraries(rdma_endpoint_reestablish_test PUBLIC transfer_engine gtest gtest_main )
 
 if (USE_CXL)
     add_executable(cxl_transport_test ${WORKSPACE}/cxl_transport_test.cpp)
@@ -58,6 +63,24 @@ if (USE_EFA)
     add_executable(efa_transport_test ${WORKSPACE}/efa_transport_test.cpp)
     target_link_libraries(efa_transport_test PUBLIC transfer_engine gtest gtest_main)
     add_test(NAME efa_transport_test COMMAND efa_transport_test)
+
+    add_executable(efa_c_api_test ${WORKSPACE}/efa_c_api_test.cpp)
+    target_link_libraries(efa_c_api_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME efa_c_api_test COMMAND efa_c_api_test)
+
+    add_executable(efa_single_nic_large_mr_test ${WORKSPACE}/efa_single_nic_large_mr_test.cpp)
+    target_link_libraries(efa_single_nic_large_mr_test PUBLIC transfer_engine gflags::gflags glog::glog)
+
+    add_executable(efa_transfer_test ${WORKSPACE}/efa_transfer_test.cpp)
+    target_link_libraries(efa_transfer_test PUBLIC transfer_engine gflags::gflags glog::glog)
+endif()
+
+# UB transport test with URMA endpoint and mock support
+if (USE_UB)
+    add_executable(ub_transport_test ${WORKSPACE}/ub_transport_test.cpp)
+    target_link_libraries(ub_transport_test PUBLIC transfer_engine gtest gtest_main glog::glog pthread)
+    target_include_directories(ub_transport_test PRIVATE ${urma_INCLUDE_DIR})
+    add_test(NAME ub_transport_test COMMAND ub_transport_test)
 endif()
 
 add_executable(transfer_metadata_test ${WORKSPACE}/transfer_metadata_test.cpp)
@@ -94,4 +117,11 @@ if (USE_ASCEND_DIRECT)
     )
 
     add_test(NAME ascend_direct_transport_test COMMAND ascend_direct_transport_test)
+endif()
+
+# Multi-protocol transport test (only when ENABLE_MULTI_PROTOCOL is ON)
+if (ENABLE_MULTI_PROTOCOL)
+    add_executable(mp_transport_test ${WORKSPACE}/mp_transport_test.cpp)
+    target_link_libraries(mp_transport_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME mp_transport_test COMMAND mp_transport_test)
 endif()

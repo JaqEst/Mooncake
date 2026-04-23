@@ -1,7 +1,9 @@
 #include <cuda_runtime.h>
 #include <thread>
 #include <mooncake_worker.cuh>
+#include <glog/logging.h>
 #include <transfer_engine.h>
+#include "pg_utils.h"
 
 namespace mooncake {
 
@@ -12,6 +14,8 @@ enum WorkerTaskStatus {
     DONE = 3,
 };
 
+static constexpr size_t kInvalidTaskId = static_cast<size_t>(-1);
+
 void MooncakeWorker::Start() {
     bool expected = false;
     if (started_.compare_exchange_strong(expected, true)) {
@@ -19,9 +23,51 @@ void MooncakeWorker::Start() {
     }
 }
 
+bool MooncakeWorker::drainTasks(const TransferGroupMeta* meta) const {
+    BackoffWaiter waiter;
+    return waiter.wait_for(
+        std::chrono::milliseconds(kDrainTasksTimeoutMs), [this, meta] {
+            for (size_t i = 0; i < kNumTasks_; ++i) {
+                if (tasks_[i].active && tasks_[i].transferGroupMeta == meta)
+                    return false;
+            }
+            return true;
+        });
+}
+
+bool MooncakeWorker::waitUntilTasksSubmitted(
+    const std::vector<CudaTaskSubmissionToken>& tasks,
+    std::chrono::milliseconds timeout) const {
+    if (tasks.empty()) {
+        return true;
+    }
+
+    auto submitted = [this, &tasks] {
+        for (const auto& task : tasks) {
+            if (task.task_id >= kNumTasks_) {
+                LOG(ERROR) << "Invalid task id.";
+                return true;
+            }
+            if (submitted_task_sequence_[task.task_id].load(
+                    std::memory_order_acquire) < task.sequence) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    BackoffWaiter waiter(
+        BackoffWaiterConfig::constantSleep(std::chrono::microseconds(10)));
+    if (timeout == kNoTimeout) {
+        waiter.wait(submitted);
+        return true;
+    }
+    return waiter.wait_for(timeout, submitted);
+}
+
 void MooncakeWorker::startWorker() {
     running_ = true;
-    std::thread([this] {
+    worker_thread_ = std::thread([this] {
         if (cuda_device_index_ >= 0) {
             cudaSetDevice(cuda_device_index_);
         }
@@ -29,7 +75,6 @@ void MooncakeWorker::startWorker() {
         using clock = std::chrono::high_resolution_clock;
         clock::time_point activeTime[kNumTasks_];
         size_t rankToTaskId[kNumTasks_][kMaxNumRanks];
-        TransferMetadata::NotifyDesc msg{"ping", "ping"};
         while (running_) {
             PAUSE();
             for (size_t i = 0; i < kNumTasks_; ++i) {
@@ -46,10 +91,16 @@ void MooncakeWorker::startWorker() {
                                      group->rank != task.broadcastRoot) ||
                                     task.opType == c10d::OpType::BARRIER;
                 if (task_status[i].load(std::memory_order_acquire) == IDLE) {
+                    const auto submit_sequence = task.submitSequence;
                     if (skipTransfer) {
+                        submitted_task_sequence_[i].store(
+                            submit_sequence, std::memory_order_release);
                         task_status[i].store(TRANSFERRED_1,
                                              std::memory_order_release);
                         continue;
+                    }
+                    for (size_t j = 0; j < kMaxNumRanks; ++j) {
+                        rankToTaskId[i][j] = kInvalidTaskId;
                     }
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < group->size; ++j) {
@@ -115,6 +166,8 @@ void MooncakeWorker::startWorker() {
                     task.batchID =
                         group->engine->allocateBatchID(entries.size());
                     group->engine->submitTransfer(task.batchID, entries);
+                    submitted_task_sequence_[i].store(
+                        submit_sequence, std::memory_order_release);
                     activeTime[i] = clock::now();
                     task_status[i].store(TRANSFERRED_1,
                                          std::memory_order_release);
@@ -131,14 +184,18 @@ void MooncakeWorker::startWorker() {
                             if (!group->activeRanks[j]) {
                                 continue;
                             }
+                            if (rankToTaskId[i][j] == kInvalidTaskId) {
+                                continue;
+                            }
                             group->engine->getTransferStatus(
                                 task.batchID, rankToTaskId[i][j], status);
                             if (status.s != TransferStatusEnum::COMPLETED) {
                                 if (status.s == TransferStatusEnum::FAILED ||
                                     (j != group->rank &&
                                      diff.count() > kPingTimeoutMicroseconds_ &&
-                                     group->engine->sendNotifyByID(
-                                         group->segmentIDs[j], msg))) {
+                                     group->engine->probePeerAliveByID(
+                                         group->segmentIDs[j]) !=
+                                         PeerLiveness::Alive)) {
                                     LOG(ERROR)
                                         << "Rank " << group->rank
                                         << " marking peer " << j
@@ -149,6 +206,7 @@ void MooncakeWorker::startWorker() {
                                     // connection poller to reconnect it.
                                     group->peerConnected[j] = false;
                                     group->activeRanks[j] = false;
+                                    group->activeRanksTensor[j] = 0;
                                 } else {
                                     batch_done = false;
                                     break;
@@ -174,6 +232,9 @@ void MooncakeWorker::startWorker() {
                     auto source_ptr = (int32_t*)group->segmentInfos[group->rank]
                                           .send_sync[task.bufferOffset];
 
+                    for (size_t j = 0; j < kMaxNumRanks; ++j) {
+                        rankToTaskId[i][j] = kInvalidTaskId;
+                    }
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < group->size; ++j) {
                         if (!group->activeRanks[j]) {
@@ -212,6 +273,9 @@ void MooncakeWorker::startWorker() {
                         if (!group->activeRanks[j]) {
                             continue;
                         }
+                        if (rankToTaskId[i][j] == kInvalidTaskId) {
+                            continue;
+                        }
                         group->engine->getTransferStatus(
                             task.batchID, rankToTaskId[i][j], status);
                         if (signal_ptr[j] != 1 ||
@@ -219,8 +283,9 @@ void MooncakeWorker::startWorker() {
                             if (status.s == TransferStatusEnum::FAILED ||
                                 (j != group->rank &&
                                  diff.count() > kPingTimeoutMicroseconds_ &&
-                                 group->engine->sendNotifyByID(
-                                     group->segmentIDs[j], msg))) {
+                                 group->engine->probePeerAliveByID(
+                                     group->segmentIDs[j]) !=
+                                     PeerLiveness::Alive)) {
                                 LOG(ERROR) << "Rank " << group->rank
                                            << " marking peer " << j
                                            << " as broken during syncing op "
@@ -230,6 +295,7 @@ void MooncakeWorker::startWorker() {
                                 // connection poller to reconnect it.
                                 group->peerConnected[j] = false;
                                 group->activeRanks[j] = false;
+                                group->activeRanksTensor[j] = 0;
                             } else {
                                 task_done = false;
                                 break;
@@ -264,7 +330,7 @@ void MooncakeWorker::startWorker() {
                 }
             }
         }
-    }).detach();
+    });
 }
 
 std::shared_ptr<MooncakeWorker> MooncakeWorkerManager::GetWorker(
