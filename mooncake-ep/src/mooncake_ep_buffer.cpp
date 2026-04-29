@@ -59,14 +59,8 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     : rank(rank),
       num_ranks(num_ranks),
       num_ep_buffer_bytes(num_ep_buffer_bytes),
-      device_name(std::move(device_name)) {
-    // Create stream of high priority via cuda runtime API
-    int least_priority = 0, greatest_priority = 0;
-    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(
-        &least_priority, &greatest_priority));
-    CUDA_CHECK(cudaStreamCreateWithPriority(
-        &comm_stream, cudaStreamNonBlocking, greatest_priority));
-
+      device_name(std::move(device_name)),
+      comm_stream(at::cuda::getStreamFromPool(true)) {
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
     // Get ranks
     CUDA_CHECK(cudaGetDevice(&device_id));
@@ -179,14 +173,10 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
 
     // Create 32 MiB workspace
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
-    CUDA_CHECK(cudaMemsetAsync(
-        workspace, 0, NUM_WORKSPACE_BYTES, at::cuda::CUDAStream(comm_stream)));
+    CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
 }
 
 MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
-    // Destroy stream manually as the one created by cuda runtime API
-    CUDA_CHECK(cudaStreamDestroy(comm_stream));
-
     if (use_fabric_mem_) {
         CUdeviceptr dptr = reinterpret_cast<CUdeviceptr>(gdr_buffer);
         cuMemUnmap(dptr, fabric_alloc_size_);
@@ -249,9 +239,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
-    auto launch_stream = return_recv_hook
-                            ? compute_stream
-                            : at::cuda::CUDAStream(comm_stream);
+    auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
 
@@ -380,9 +368,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
-    auto launch_stream = return_recv_hook
-                            ? compute_stream
-                            : at::cuda::CUDAStream(comm_stream);
+    auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
 
@@ -555,7 +541,7 @@ int MooncakeEpBuffer::init_ibgda() {
     for (int i = 0; i < USE_QP_COUNT; ++i) {
         mlx5gda_qp* qp =
             mlx5gda_create_rc_qp(mpd, ctrl_buf, ctrl_buf_umem, ctrl_buf_heap,
-                                 pd, 16384, 1, comm_stream);
+                                 pd, 16384, 1, comm_stream.stream());
         if (!qp) {
             perror("Failed to create QP");
             return -1;
@@ -567,7 +553,7 @@ int MooncakeEpBuffer::init_ibgda() {
         }
         // Ensure all async memset operations are complete before accessing QP
         // structures
-        CUDA_CHECK(cudaStreamSynchronize(comm_stream));
+        CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
 
         mlx5gda_qp_devctx qp_devctx = {
             .qpn = qp->qpn,
@@ -595,7 +581,7 @@ void MooncakeEpBuffer::update_local_qpns() {
     for (int i = 0; i < USE_QP_COUNT; ++i) {
         mlx5gda_qp* qp =
             mlx5gda_create_rc_qp(mpd, ctrl_buf, ctrl_buf_umem, ctrl_buf_heap,
-                                 pd, 16384, 1, comm_stream);
+                                 pd, 16384, 1, comm_stream.stream());
         if (!qp) {
             perror("Failed to recreate QP");
             ibgda_disabled_ = true;
@@ -609,7 +595,7 @@ void MooncakeEpBuffer::update_local_qpns() {
         }
         // Ensure all async memset operations are complete before accessing QP
         // structures
-        CUDA_CHECK(cudaStreamSynchronize(comm_stream));
+        CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
 
         mlx5gda_qp_devctx qp_devctx = {
             .qpn = qp->qpn,
