@@ -822,6 +822,11 @@ def get_group_size(group=None) -> int:
     pg = _get_group(group)
     return _C.get_group_size(pg.backend)
 
+def join_group(group=None):
+    """Join the group."""
+    pg = _get_group(group)
+    return _C.join_group(pg.backend)
+
 
 # ==================== Helper Functions ====================
 
