@@ -633,7 +633,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
             connection_ctx_, [=](void*, size_t, size_t) {},
             [=](void*, size_t, size_t) {});
     } else {
-        auto device_index = at::cuda::current_device();
+        auto device_index = phi::backends::gpu::GetCurrentDeviceId();
         auto stream = at::cuda::getCurrentCUDAStream(device_index);
         return worker_->putTaskCuda(
             c10d::OpType::BARRIER, kBarrierDummyTensorSize, 0, meta_,
@@ -906,7 +906,7 @@ void MooncakeBackend::waitForExtensionState() {
         BackoffWaiterConfig::constantSleep(std::chrono::milliseconds(50)));
 
     waiter.wait([&] {
-        return meta_->store->check({task_count_key, active_ranks_key});
+        return meta_->store->check(task_count_key) && meta_->store->check(active_ranks_key);
     });
 
     auto task_count_data = meta_->store->get(task_count_key);

@@ -6,7 +6,6 @@
 #include <c10/core/Event.h>
 #include <compat/future.h>
 #include <omp.h>
-#include <ATen/cuda/CUDAGraphsUtils.cuh>
 
 #include "pg_utils.h"
 
@@ -45,18 +44,7 @@ class MooncakeWorkCuda : public ::c10d::Work {
           worker_(worker),
           submitted_tasks_(std::move(submitted_tasks)) {}
 
-    bool isCompleted() override {
-        cudaError_t err = cudaEventQuery(event_->cuda_event());
-        if (err == cudaSuccess) {
-            return true;
-        } else if (err != cudaErrorNotReady) {
-            C10_CUDA_CHECK(err);
-        } else {
-            (void)cudaGetLastError();  // Reset error
-        }
-
-        return false;
-    }
+    bool isCompleted() override { return event_->query(); }
 
     bool wait(std::chrono::milliseconds timeout) override {
         // Wait until the task has been submitted to TransferEngine:
@@ -102,8 +90,9 @@ class MooncakeWorkCuda : public ::c10d::Work {
         // waitUntilTasksSubmitted is totally unnecessary, but we keep it for
         // uniform behavior to avoid invasive changes to TE/TENT.
         bool submitted = true;
-        if (at::cuda::currentStreamCaptureStatus() ==
-            c10::cuda::CaptureStatus::None) {
+        cudaStreamCaptureStatus status{cudaStreamCaptureStatusNone};
+        C10_CUDA_CHECK(cudaStreamIsCapturing(c10::cuda::getCurrentCUDAStream(), &status));
+        if (status == cudaStreamCaptureStatusNone) {
             // Normal execution: block until tasks are submitted.
             submitted =
                 worker_->waitUntilTasksSubmitted(submitted_tasks_, timeout);
@@ -150,8 +139,9 @@ class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
     bool wait(std::chrono::milliseconds timeout) override {
         // Skip host-side synchronization during CUDA graph capture.
         // cudaEventSynchronize is not permitted while a stream is capturing.
-        if (at::cuda::currentStreamCaptureStatus() !=
-            c10::cuda::CaptureStatus::None) {
+        cudaStreamCaptureStatus status{cudaStreamCaptureStatusNone};
+        C10_CUDA_CHECK(cudaStreamIsCapturing(c10::cuda::getCurrentCUDAStream(), &status));
+        if (status != cudaStreamCaptureStatusNone) {
             // We still need stream-level synchronization so that subsequent
             // operations on the capture stream are ordered after the barrier
             // task on the enqueue stream.

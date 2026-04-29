@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ATen/core/ivalue.h>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -7,18 +8,14 @@
 
 namespace c10 {
 
-enum class TypeKind {
-  TensorType,
-  ListType,
-};
-
 class Type;
 using TypePtr = std::shared_ptr<Type>;
+using TypeTag = torch::TypeTag;
 
 class Type : public std::enable_shared_from_this<Type> {
  public:
   virtual ~Type() = default;
-  virtual TypeKind kind() const = 0;
+  virtual TypeTag kind() const = 0;
 
   virtual bool equals(const Type& other) const {
     return kind() == other.kind();
@@ -43,7 +40,7 @@ class TensorType : public Type {
 
   explicit TensorType(PrivateTag) {}
 
-  TypeKind kind() const override { return TypeKind::TensorType; }
+  TypeTag kind() const override { return TypeTag::Tensor; }
 };
 
 class ListType : public Type {
@@ -61,7 +58,7 @@ class ListType : public Type {
   explicit ListType(PrivateTag, TypePtr elem_type)
     : elem_type_(std::move(elem_type)) {}
 
-  TypeKind kind() const override { return TypeKind::ListType; }
+  TypeTag kind() const override { return TypeTag::GenericList; }
 
   const TypePtr& getElementType() const { return elem_type_; }
 
@@ -76,15 +73,6 @@ class ListType : public Type {
 
  private:
   TypePtr elem_type_;
-};
-
-class IValue {
- public:
-  IValue() : is_none_(true) {}
-  bool isNone() const { return is_none_; }
-
- private:
-  bool is_none_;
 };
 
 namespace ivalue {
