@@ -14,6 +14,8 @@ from mooncake import pg
 
 def init_dist(local_rank: int, num_local_ranks: int):
     # NOTES: you may rewrite this function with your own cluster settings
+    ip = os.getenv('MASTER_ADDR', '127.0.0.1')
+    port = int(os.getenv('MASTER_PORT', '8361'))
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
     node_rank = int(os.getenv('RANK', 0))
     assert (num_local_ranks < 8 and num_nodes == 1) or num_local_ranks == 8
@@ -21,6 +23,7 @@ def init_dist(local_rank: int, num_local_ranks: int):
     paddle.cuda.set_device(local_rank)
     dist.init_process_group(
         backend='mooncake',
+        init_method=f'tcp://{ip}:{port}',
         world_size=num_nodes * num_local_ranks,
         rank=node_rank * num_local_ranks + local_rank,
         pg_options=pg.MooncakeBackendOptions(
