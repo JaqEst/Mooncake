@@ -28,7 +28,6 @@ if CUDA_HOME is not None:
         cuda_library_dirs.append(cuda_stub_dir)
 
 
-
 setup(
     name=module_name,
     ext_modules=[
@@ -45,15 +44,29 @@ setup(
                 "src/mooncake_ibgda/mlx5gda.cpp",
             ],
             extra_compile_args={
-                "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-O3", "-g0"],
-                "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-Xcompiler", "-O3", "-Xcompiler", "-g0"],
+                "cxx": [
+                    f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
+                    "-std=c++20",
+                    "-O3",
+                    "-g0"
+                ],
+                "nvcc": [
+                    f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
+                    "-std=c++20",
+                    "-Xcompiler",
+                    "-O3",
+                    "-Xcompiler",
+                    "-g0"
+                ],
             },
             libraries=cuda_libraries,
             library_dirs=cuda_library_dirs,
             extra_link_args=[
                 "-Wl,-rpath,$ORIGIN",
                 "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
+                "-Wl,--no-as-needed",
                 "-l:engine.so",
+                "-Wl,--as-needed",
             ],
         )
     ],

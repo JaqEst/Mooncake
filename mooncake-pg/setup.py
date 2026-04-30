@@ -67,7 +67,9 @@ setup(
             extra_link_args=[
                 "-Wl,-rpath,$ORIGIN",
                 "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
+                "-Wl,--no-as-needed",
                 "-l:engine.so",
+                "-Wl,--as-needed",
             ],
         )
     ],
