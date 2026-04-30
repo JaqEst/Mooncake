@@ -13,7 +13,6 @@
 #include <mooncake_ep_event.h>
 #include <mooncake_ep_exception.cuh>
 #include <torch/torch.h>
-#include <glog/logging.h>
 
 namespace mooncake {
 
@@ -143,31 +142,7 @@ struct MooncakeEpBuffer {
 
     bool is_roce() { return is_roce_; }
 
-    // Decide whether EP can safely run CUDA kernels (\"fast-path\").
-    //
-    // There are two independent ways EP kernels can work:
-    // - IBGDA RDMA path: requires successful IBGDA init (qps/mr/etc).
-    // - NVLink P2P+IPC path: requires full P2P+IPC across ranks on the same
-    // node.
-    //
-    // IMPORTANT INVARIANT:
-    // If `p2p_ipc_all_enabled_ == true`, `sync_nvlink_ipc_handles()` guarantees
-    // `nvlink_available[dst_rank] == 1` for every rank pair, so the CUDA
-    // kernels will never take the IBGDA branch and therefore do NOT require
-    // `qps`.
-    bool use_fast_path() {
-        if (!ibgda_disabled_) {
-            return true;  // IBGDA available
-        }
-        // IBGDA disabled: only allow fast-path if we can rely on NVLink
-        // P2P+IPC.
-        if (!p2p_ipc_all_enabled_) {
-            LOG(WARNING) << "Failed to initialize IBGDA. "
-                         << "Using fallback implementation. "
-                         << "Performance will be degraded.";
-        }
-        return p2p_ipc_all_enabled_;
-    }
+    bool use_fast_path();
 
     void update_local_qpns();
 
