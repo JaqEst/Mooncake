@@ -15,8 +15,6 @@ TEST_DEVICE = "cuda" if USE_CUDA else "cpu"
 os.environ["MASTER_ADDR"] = "127.0.0.1"
 os.environ["MASTER_PORT"] = "19000"
 
-filters = ["mlx5_1", "mlx5_2", "mlx5_3", "mlx5_4", "mlx5_5", "mlx5_6", "mlx5_7", "mlx5_8"]
-
 broken_rank = 1
 
 
@@ -29,10 +27,8 @@ def _set_device(rank):
 
 def _elastic_worker(rank, num_processes, signals):
     """Worker for testing elastic world size extension."""
-    dist.set_device_filter(filters)
     _set_device(rank)
     assert num_processes % 2 == 0
-
     if rank < num_processes // 2:
         # Ensure correct operation before extension
         world_size = num_processes // 2
@@ -79,7 +75,6 @@ def _elastic_worker(rank, num_processes, signals):
 
 def _deferred_recovery_worker(rank, num_processes, signals):
     """Worker for testing deferred rank recovery join."""
-    dist.set_device_filter(filters)
     if rank < num_processes:
         _set_device(rank)
         dist.init_process_group(
@@ -102,7 +97,6 @@ def _deferred_recovery_worker(rank, num_processes, signals):
 
         time.sleep(5)
         signals["recover"] = 1
-
         while True:
             (peer_state,) = dist.get_peer_state([broken_rank])
             if peer_state:
