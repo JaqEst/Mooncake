@@ -24,6 +24,7 @@ Example:
 """
 
 import os
+import hashlib
 from datetime import timedelta
 from typing import List, Optional, Union, Any
 
@@ -96,7 +97,7 @@ class ProcessGroup:
 
     def size(self) -> int:
         """Get the size of this process group."""
-        return self._backend.size()
+        return _C.get_group_size(self.backend)
 
     def rank(self) -> int:
         """Get the local rank of current process within this group."""
@@ -226,6 +227,7 @@ class ProcessGroup:
 
 # Global state
 _default_pg: Optional[ProcessGroup] = None
+_default_store = None
 _pg_map = {}  # group_id -> ProcessGroup
 _initialized = False
 
@@ -267,7 +269,7 @@ def init_process_group(
         AssertionError: If both init_method and store are provided
         ValueError: If store is not provided, and init_method is not tcp://xxx:yyy
     """
-    global _default_pg, _initialized
+    global _default_pg, _default_store, _initialized
 
     if _initialized:
         raise RuntimeError("Distributed already initialized")
@@ -312,10 +314,12 @@ def init_process_group(
             "Please provide a compatible store instance (e.g., TCPStore from your framework). "
         )
 
+    prefix_store = _C.PrefixStore(group_id, store)
     _default_pg = _new_process_group_helper(
-        backend, store, rank, world_size, timeout, group_id, pg_options,
+        backend, prefix_store, rank, world_size, timeout, group_id, pg_options,
         global_ranks=list(range(world_size))
     )
+    _default_store = store
     _pg_map[group_id] = _default_pg
     _initialized = True
 
@@ -368,14 +372,15 @@ def new_group(
     group_size = len(ranks)
 
     if group_id is None:
-        group_id = f"group_{len(_pg_map)}_{'-'.join(map(str, ranks))}"
+        group_id = _hash_ranks_to_str(ranks)
 
     # Use the default store if not provided
     if store is None:
-        store = _default_pg.store
+        store = _default_store
 
+    prefix_store = _C.PrefixStore(group_id, store)
     pg = _new_process_group_helper(
-        backend, store, local_rank, group_size, timeout, group_id, pg_options,
+        backend, prefix_store, local_rank, group_size, timeout, group_id, pg_options,
         global_ranks=ranks
     )
     _pg_map[group_id] = pg
@@ -391,6 +396,9 @@ def destroy_process_group(group=None):
     """
     global _default_pg, _initialized, _pg_map
 
+    if group == NON_GROUP_MEMBER:
+        return
+
     if group is None:
         # Destroy all groups
         for pg in _pg_map.values():
@@ -402,7 +410,7 @@ def destroy_process_group(group=None):
     else:
         group.shutdown()
         # Remove from map
-        _pg_map = {k: v for k, v in _pg_map.items() if v is not group}
+        del _pg_map[group.group_id]
 
 
 def get_backend(group=None) -> str:
@@ -837,6 +845,14 @@ def _check_initialized():
 
 def _get_default_timeout():
     return timedelta(seconds=5 * 60)
+
+
+def _hash_ranks_to_str(ranks: list[int]):
+    rank_join = "_".join(map(str, ranks))
+    # In case there is already a PG with the same rank composition
+    unique_str = "_".join([rank_join, str(len(_pg_map))])
+    return hashlib.sha1(bytes(unique_str, "utf-8"), usedforsecurity=False).hexdigest()
+
 
 def _get_group(group):
     """Get process group, using default if None."""

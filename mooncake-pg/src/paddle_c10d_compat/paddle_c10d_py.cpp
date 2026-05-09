@@ -6,6 +6,7 @@
 #include <torch/python.h>
 
 #include <paddle_c10d_compat/backend.h>
+#include <paddle_c10d_compat/store.h>
 #include <paddle_c10d_compat/types.h>
 #include <paddle_c10d_compat/work.h>
 
@@ -100,6 +101,12 @@ void bindC10dCompat(py::module_& m) {
         .def_readwrite("root_rank", &c10d::ScatterOptions::rootRank)
         .def_readwrite("timeout", &c10d::ScatterOptions::timeout)
         .def_readwrite("async_op", &c10d::ScatterOptions::asyncOp);
+
+    py::module_::import("paddle.base.core");
+    py::class_<c10d::PrefixStore, c10d::Store,
+               c10::intrusive_ptr<c10d::PrefixStore>>(m, "PrefixStore")
+        .def(py::init<std::string, c10::intrusive_ptr<c10d::Store>>(),
+              py::arg("prefix"), py::arg("store"));
 
     py::class_<c10d::DistributedBackendOptions>(m, "DistributedBackendOptions")
         .def(py::init<>())
