@@ -5,9 +5,9 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <torch/all.h>
-#include <compat/types.h>
-#include <compat/work.h>
-#include <compat/store.h>
+#include <paddle_c10d_compat/types.h>
+#include <paddle_c10d_compat/work.h>
+#include <paddle_c10d_compat/store.h>
 #include <transfer_engine.h>
 
 #include <memory>

@@ -10,7 +10,7 @@
 #include <p2p_proxy.h>
 #include <sys/types.h>
 #include <torch/all.h>
-#include <compat/backend.h>
+#include <paddle_c10d_compat/backend.h>
 #include <transfer_engine.h>
 
 namespace mooncake {

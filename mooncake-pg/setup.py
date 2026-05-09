@@ -45,6 +45,7 @@ setup(
                 "src/mooncake_worker.cu",
                 "src/mooncake_worker_thread.cpp",
                 "src/connection_poller.cpp",
+                "src/paddle_c10d_compat/paddle_c10d_py.cpp",
             ],
             extra_compile_args={
                 "cxx": [

@@ -4,7 +4,7 @@
 #include <thread>
 #include <mooncake_worker.cuh>
 #include <c10/core/Event.h>
-#include <compat/future.h>
+#include <paddle_c10d_compat/future.h>
 #include <omp.h>
 
 #include "pg_utils.h"
