@@ -392,6 +392,8 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             global_peerConnected_[globalPollingRank] = false;
             meta_->peerConnected[pollingRank] = false;
             meta_->activeRanks[pollingRank] = false;
+            // TODO: Avoid tensor scalar assignment here; keep activeRanksTensor in sync
+            // through the same activeRanks -> activeRanksTensor refresh path used by worker tasks.
             meta_->activeRanksTensor[pollingRank] = 0;
 
             // Reset store
