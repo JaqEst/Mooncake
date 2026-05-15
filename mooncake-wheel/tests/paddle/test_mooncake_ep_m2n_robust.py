@@ -462,10 +462,6 @@ def worker_t_recovery_survivor(rank: int, barrier_dir: str,
     bar.arrive_and_wait("phase2_done", rank, SURVIVORS)
     log(rank, role, "T_Recovery Phase 2 PASSED")
 
-    # Phase 3 -- recover rank 3 in-place using pg elastic APIs
-    log(rank, role, "T_Recovery Phase 3: waiting for new rank-3 process to connect...")
-    bar.wait_for("new_r3_ready", [3])
-
     # Poll until the new rank-3 process has connected to the PG backend
     backend = group._get_backend(paddle.device("cuda"))
     while True:
@@ -473,6 +469,10 @@ def worker_t_recovery_survivor(rank: int, barrier_dir: str,
         if peer_state:
             break
         time.sleep(0.1)
+
+    # Phase 3 -- recover rank 3 in-place using pg elastic APIs
+    log(rank, role, "T_Recovery Phase 3: waiting for new rank-3 process to connect...")
+    bar.wait_for("new_r3_ready", [3])
     log(rank, role, "T_Recovery Phase 3: new rank 3 connected, calling recover_ranks()")
     pg.recover_ranks(backend, [3])
     active[3] = 1
@@ -571,11 +571,6 @@ def worker_t_recovery_rank3_new(rank: int, barrier_dir: str,
     log(rank, role, "T_Recovery Phase 3: waiting for TCPStore cleanup...")
     time.sleep(1.5)
 
-    # Signal readiness so survivors can start polling get_peer_state
-    bar.arrive("new_r3_ready", rank)
-
-    # Join the existing group as a recovered rank using MooncakeBackendOptions
-    log(rank, role, "T_Recovery Phase 3: joining existing group with is_extension=True")
     dist.init_process_group(
         backend="mooncake",
         init_method=f"tcp://127.0.0.1:{port}",
@@ -586,6 +581,13 @@ def worker_t_recovery_rank3_new(rank: int, barrier_dir: str,
             True,  # is_extension=True for recovered rank
         ),
     )
+
+    # Signal readiness so survivors can start polling get_peer_state
+    bar.arrive("new_r3_ready", rank)
+
+    # Join the existing group as a recovered rank using MooncakeBackendOptions
+    log(rank, role, "T_Recovery Phase 3: joining existing group with is_extension=True")
+    dist.join_group()
     group = dist.get_default_group()
 
     phy2log  = build_phy2log(4, FFN, NUM_LOGICAL)
