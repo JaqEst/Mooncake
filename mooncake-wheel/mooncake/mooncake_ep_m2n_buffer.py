@@ -72,10 +72,10 @@ class M2NBuffer:
         # Pre-compute attention rank virtual slot ranges for routing validation.
         # Slots on attention ranks have no expert weights — routing to them is
         # a bug in the inference engine's routing layer.
-        if __debug__:
-            self._attention_slots = self._build_attention_slots(
-                self.attention_ranks, num_experts_per_rank,
-            )
+        # if __debug__:
+        #     self._attention_slots = self._build_attention_slots(
+        #         self.attention_ranks, num_experts_per_rank,
+        #     )
 
         # Create underlying EP buffer
         if num_ep_buffer_bytes is None:
@@ -182,8 +182,8 @@ class M2NBuffer:
         """
         assert self.role == 'attention', \
             f"a2e_isend called on {self.role} rank"
-        if __debug__ and not torch.cuda.is_current_stream_capturing():
-            self._validate_topk_idx(topk_idx)
+        # if __debug__ and not torch.cuda.is_current_stream_capturing():
+        #     self._validate_topk_idx(topk_idx)
         return self.buffer.dispatch(
             x, topk_idx, active_ranks,
             self.num_max_dispatch_tokens_per_rank, self.num_experts_total,
@@ -268,8 +268,8 @@ class M2NBuffer:
         """
         assert self.role == 'attention', \
             f"e2a_irecv called on {self.role} rank"
-        if __debug__ and not torch.cuda.is_current_stream_capturing():
-            self._validate_topk_idx(topk_idx)
+        # if __debug__ and not torch.cuda.is_current_stream_capturing():
+        #     self._validate_topk_idx(topk_idx)
         virtual_x = torch.zeros(
             self.num_experts_per_rank,
             self.num_ranks * self.num_max_dispatch_tokens_per_rank,

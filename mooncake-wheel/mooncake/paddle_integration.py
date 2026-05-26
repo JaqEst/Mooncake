@@ -225,8 +225,12 @@ def init_mooncake_pg(
     rank: int,
     clean_existed_groups: bool = False,
     ib_device_filter: List = None,
+    host_ip: str = None,
     logger: Any = None
 ) -> None:
+    if host_ip:
+        dist.set_host_ip(host_ip)
+
     if ib_device_filter:
         dist.set_device_filter(ib_device_filter)
 
