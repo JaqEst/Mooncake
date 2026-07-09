@@ -14,7 +14,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 ARG PYTHON_VERSION=3.10
 ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
 ARG CMAKE_BUILD_TYPE=Release
-ARG EP_TORCH_VERSIONS="2.9.1"
+ARG EP_TORCH_VERSIONS="2.12.1"
 ARG TORCH_CUDA_ARCH_LIST="8.0;9.0"
 
 ENV PYTHON_VERSION=${PYTHON_VERSION} \
@@ -116,6 +116,7 @@ RUN apt-get update && \
 
 # Copy wheels produced in builder stage and install them via pip
 COPY --from=builder /workspace/mooncake-wheel/dist /tmp/mooncake-wheel
+COPY --chmod=755 scripts/check_hicache_hugepage_requirements.py /usr/local/bin/mooncake-hicache-sizing
 RUN python${PYTHON_VERSION} -m pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
 
 CMD ["/bin/bash"]

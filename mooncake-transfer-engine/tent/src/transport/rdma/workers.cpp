@@ -17,8 +17,11 @@
 #include <sys/epoll.h>
 
 #include <cassert>
+#include <fstream>
+#include <sstream>
 
 #include "tent/transport/rdma/endpoint_store.h"
+#include "tent/transport/rdma/shared_quota.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/string_builder.h"
 #include "tent/common/utils/os.h"
@@ -27,25 +30,146 @@
 namespace mooncake {
 namespace tent {
 thread_local int tl_wid = -1;
+
+namespace {
+// Look up (or create) the RailMonitor for `machine_id` on this worker's
+// map. Returning a stable reference is safe because the map stores values
+// via unique_ptr -- rehashes move the pointer slot, not the RailMonitor.
+RailMonitor& getOrCreateRail(
+    std::unordered_map<std::string, std::unique_ptr<RailMonitor>>& rails,
+    const std::string& machine_id) {
+    auto it = rails.find(machine_id);
+    if (it != rails.end()) return *it->second;
+    auto [ins, _] = rails.emplace(machine_id, std::make_unique<RailMonitor>());
+    return *ins->second;
+}
+}  // namespace
+
 Workers::Workers(RdmaTransport* transport)
     : transport_(transport), num_workers_(0), running_(false) {
-    device_quota_ = std::make_unique<DeviceQuota>();
-    device_quota_->loadTopology(transport_->local_topology_);
+    device_selector_ = std::make_unique<DeviceSelector>();
+    device_selector_->loadTopology(transport_->local_topology_);
     auto& conf = transport_->conf_;
+
+    // RailMonitor consumes JSON text, while the public configuration is a file
+    // path. Load it once here instead of reopening the file for every worker
+    // and every remote machine. Invalid/missing files fall back to automatic
+    // topology matching in RailMonitor::load().
+    const auto& rail_topo_path = transport_->params_->workers.rail_topo_path;
+    if (!rail_topo_path.empty()) {
+        std::ifstream input(rail_topo_path);
+        if (!input.is_open()) {
+            LOG(WARNING) << "Unable to open RDMA rail topology file "
+                         << rail_topo_path << "; using automatic rail mapping";
+        } else {
+            std::ostringstream contents;
+            contents << input.rdbuf();
+            rail_topo_json_ = contents.str();
+            if (rail_topo_json_.empty()) {
+                LOG(WARNING) << "RDMA rail topology file " << rail_topo_path
+                             << " is empty; using automatic rail mapping";
+            }
+        }
+    }
+
+    // ============================================================
+    // Core Scheduling Configuration
+    // ============================================================
+
+    // Enable/disable smart scheduling (false = simple round-robin)
+    bool enable_smart_scheduling =
+        conf->get("transports/rdma/enable_smart_scheduling", true);
+    device_selector_->setSmartSelection(enable_smart_scheduling);
+
+    // ============================================================
+    // NUMA Distance Penalties
+    // Higher values = higher penalty for cross-NUMA access
+    // Format: [local_numa, remote_numa1, remote_numa2, ...]
+    // ============================================================
+    DeviceSelector::SchedulingParams params;
+
+    auto numa_penalties =
+        conf->get("transports/rdma/numa_penalties", std::vector<double>{});
+    if (numa_penalties.size() == Topology::DevicePriorityRanks) {
+        for (size_t i = 0; i < Topology::DevicePriorityRanks; ++i) {
+            params.numa_tier_weights[i] = numa_penalties[i];
+        }
+    }
+
+    // ============================================================
+    // Bandwidth Estimation (EWMA)
+    // ============================================================
+
+    // Learning rate: 0.0 = full adaptation, 1.0 = no adaptation
+    params.bandwidth_learning_rate =
+        conf->get("transports/rdma/bandwidth_learning_rate", 0.01);
+
+    // EWMA bounds as multipliers of theoretical bandwidth
+    params.ewma_min_multiplier =
+        conf->get("transports/rdma/ewma_min_bandwidth_multiplier", 0.1);
+    params.ewma_max_multiplier =
+        conf->get("transports/rdma/ewma_max_bandwidth_multiplier", 10.0);
+
+    // ============================================================
+    // Device Selection Scoring
+    // ============================================================
+
+    // Random jitter to avoid deterministic selection
+    params.score_jitter_range =
+        conf->get("transports/rdma/score_jitter_range", 1e-9);
+
+    // Small value to prevent division by zero
+    params.score_epsilon = conf->get("transports/rdma/score_epsilon", 1e-12);
+
+    // ============================================================
+    // Priority-Based Filtering
+    // ============================================================
+
+    params.enable_priority_filtering =
+        conf->get("transports/rdma/enable_priority_filtering", true);
+
+    // Local device priority rotation interval (microseconds)
+    params.local_rotation_interval_us =
+        conf->get("transports/rdma/local_rotation_interval_us", 200);
+
+    // ============================================================
+    // Priority Promotion (Anti-Starvation)
+    // ============================================================
+
+    // Timeout after which low-priority requests get promoted (nanoseconds)
+    // Default: 10ms (10000000 ns)
+    priority_promotion_timeout_ns_ =
+        conf->get("transports/rdma/priority_promotion_timeout_us", 10000) *
+        1000ull;
+
+    // ============================================================
+    // Global Slot Coordination (Multi-Process)
+    // ============================================================
+
+    params.slot_rotation_interval_ms =
+        conf->get("transports/rdma/slot_rotation_interval_ms", 2);
+
+    // ============================================================
+    // Bandwidth Constants (Gbps)
+    // ============================================================
+
+    params.default_bandwidth_gbps =
+        conf->get("transports/rdma/default_bandwidth_gbps", 400.0);
+    params.min_bandwidth_gbps =
+        conf->get("transports/rdma/min_bandwidth_gbps", 10.0);
+    params.max_bandwidth_gbps =
+        conf->get("transports/rdma/max_bandwidth_gbps", 800.0);
+
+    device_selector_->setSchedulingParams(params);
+
+    // ============================================================
+    // Shared Memory Configuration
+    // ============================================================
+
     auto shared_quota_shm_path =
         conf->get("transports/rdma/shared_quota_shm_path", "");
     if (!shared_quota_shm_path.empty())
-        device_quota_->enableSharedQuota(shared_quota_shm_path);
-    auto cross_numa_access =
-        conf->get("transports/rdma/cross_numa_access", false);
-    device_quota_->setCrossNumaAccess(cross_numa_access);
-    auto local_weight = conf->get("transports/rdma/local_weight", 1.0);
-    device_quota_->setLocalWeight(local_weight);
-    auto learning_rate = conf->get("transports/rdma/learning_rate", 0.1);
-    device_quota_->setLearningRate(learning_rate);
-    auto diffusion_interval =
-        conf->get("transports/rdma/diffusion_interval", 10);
-    device_quota_->setDiffusionInterval(diffusion_interval);
+        device_selector_->enableSharedQuota(shared_quota_shm_path);
 }
 
 Workers::~Workers() {
@@ -102,7 +226,14 @@ Status Workers::submit(RdmaSliceList& slice_list, int worker_id) {
         }
     }
     auto& worker = worker_context_[worker_id];
-    worker.queue.push(slice_list);
+
+    // Get priority from first slice (all slices in list have same priority)
+    int priority = PRIO_HIGH;
+    if (slice_list.first && slice_list.first->task) {
+        priority = slice_list.first->priority;
+    }
+
+    worker.queues[priority].push(slice_list);
     if (!worker.inflight_slices.fetch_add(slice_list.num_slices)) {
         std::lock_guard<std::mutex> lock(worker.mutex);
         if (worker.in_suspend) worker.cv.notify_all();
@@ -122,14 +253,15 @@ Status Workers::cancel(RdmaSliceList& slice_list) {
 }
 
 std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
-    std::string rpc_server_addr, target_seg_name, target_dev_name;
+    std::string rpc_server_addr, target_seg_name, target_dev_name,
+        target_nic_path_name;
     RouteHint hint;
     auto& segment_manager = transport_->metadata_->segmentManager();
     auto target_id = path.remote_segment_id;
     auto device_id = path.remote_device_id;
 
-    auto status =
-        segment_manager.withCachedSegment(target_id, [&](SegmentDesc* segment) {
+    auto status = segment_manager.withCachedSegment(
+        target_id, hint.pin, [&](SegmentDesc* segment) {
             hint.segment = segment;
             if (segment->type != SegmentType::Memory) {
                 return Status::NeedsRefreshCache(
@@ -140,6 +272,7 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
                 rpc_server_addr = segment->rpc_server_addr;
             }
             target_seg_name = segment->name;
+            target_nic_path_name = segment->nicPathServerName();
             target_dev_name = hint.topo->getNicName(device_id);
             if (target_seg_name.empty() || target_dev_name.empty()) {
                 return Status::NeedsRefreshCache(
@@ -160,12 +293,8 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
                          // connection unavailable
     }
     std::shared_ptr<RdmaEndPoint> endpoint;
-    auto peer_name = MakeNicPath(target_seg_name, target_dev_name);
+    auto peer_name = MakeNicPath(target_nic_path_name, target_dev_name);
     endpoint = context->endpointStore()->getOrInsert(peer_name);
-    if (endpoint && endpoint->status() == RdmaEndPoint::EP_RESET) {
-        context->endpointStore()->remove(endpoint.get());
-        endpoint = context->endpointStore()->getOrInsert(peer_name);
-    }
     if (!endpoint) {
         LOG(ERROR) << "Cannot allocate endpoint " << peer_name;
         return nullptr;
@@ -188,30 +317,32 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
 }
 
 void Workers::disableEndpoint(RdmaSlice* slice) {
-    SegmentDesc* desc = nullptr;
-    auto& segment_manager = transport_->metadata_->segmentManager();
-    auto target_id = slice->task->request.target_id;
-    if (target_id == LOCAL_SEGMENT_ID) {
-        desc = segment_manager.getLocal().get();
-    } else {
-        auto status = segment_manager.getRemoteCached(desc, target_id);
-        if (!status.ok()) return;
-    }
-    if (desc) {
-        auto& worker = worker_context_[tl_wid];
-        auto& rail = worker.rails[desc->machine_id];
-        rail.markFailed(slice->source_dev_id, slice->target_dev_id);
+    if (auto* rail = slice->rail_monitor) {
+        rail->markFailed(slice->source_dev_id, slice->target_dev_id);
     }
     if (auto ep = slice->ep_weak_ptr.lock()) {
         ep->acknowledge(slice, FAILED);
-        ep->reset();
+        ep->resetConnection("Endpoint failed");
     }
 }
 
 void Workers::asyncPostSend() {
     auto& worker = worker_context_[tl_wid];
     std::vector<RdmaSliceList> result;
-    worker.queue.pop(result);
+
+    auto shared_quota =
+        device_selector_ ? device_selector_->getSharedSlotManager() : nullptr;
+
+    // Promote timed-out low priority requests
+    promoteTimedOutRequests(worker);
+
+    // Priority selection: HIGH -> MEDIUM -> LOW
+    for (int prio = PRIO_HIGH; prio < kNumPriorityLevels; ++prio) {
+        if (shared_quota && !shared_quota->canSend(prio)) continue;
+        worker.queues[prio].pop(result);
+        if (!result.empty()) break;
+    }
+
     for (auto& slice_list : result) {
         if (slice_list.num_slices == 0) continue;
         auto slice = slice_list.first;
@@ -282,6 +413,49 @@ void Workers::asyncPostSend() {
     }
 }
 
+void Workers::promoteTimedOutRequests(WorkerContext& worker) {
+    uint64_t current_ts = getCurrentTimeInNano();
+    if (current_ts < worker.next_promotion_check_ns) return;
+
+    // Set next check time (1ms from now)
+    worker.next_promotion_check_ns = current_ts + 1000000ull;
+
+    // Check MEDIUM -> HIGH promotion
+    std::vector<RdmaSliceList> promoted;
+    worker.queues[PRIO_MEDIUM].pop(promoted);
+    if (!promoted.empty()) {
+        auto* slice = promoted.front().first;
+        if (slice && slice->enqueue_ts > 0 &&
+            (current_ts - slice->enqueue_ts) >=
+                priority_promotion_timeout_ns_) {
+            for (auto& slice_list : promoted) {
+                worker.queues[PRIO_HIGH].push(slice_list);
+            }
+            return;
+        }
+        for (auto& slice_list : promoted) {
+            worker.queues[PRIO_MEDIUM].push(slice_list);
+        }
+    }
+
+    // Check LOW -> MEDIUM promotion
+    worker.queues[PRIO_LOW].pop(promoted);
+    if (!promoted.empty()) {
+        auto* slice = promoted.front().first;
+        if (slice && slice->enqueue_ts > 0 &&
+            (current_ts - slice->enqueue_ts) >=
+                priority_promotion_timeout_ns_) {
+            for (auto& slice_list : promoted) {
+                worker.queues[PRIO_MEDIUM].push(slice_list);
+            }
+            return;
+        }
+        for (auto& slice_list : promoted) {
+            worker.queues[PRIO_LOW].push(slice_list);
+        }
+    }
+}
+
 void Workers::asyncPollCq() {
     auto& worker = worker_context_[tl_wid];
     const static size_t kPollCount = 64;
@@ -327,8 +501,8 @@ void Workers::asyncPollCq() {
             double inflight_lat = (poll_ts - slice->submit_ts) / 1000.0;
             double overall_lat_sec = (poll_ts - slice->enqueue_ts) / 1e9;
             if (slice->retry_count == 0) {
-                device_quota_->release(slice->source_dev_id, slice->length,
-                                       overall_lat_sec);
+                device_selector_->release(slice->source_dev_id, slice->length,
+                                          overall_lat_sec);
             }
             if (slice->word != PENDING) continue;
             if (!ep) {
@@ -361,6 +535,14 @@ void Workers::asyncPollCq() {
                 }
             } else {
                 num_slices += ep->acknowledge(slice, COMPLETED);
+                // A successful transfer proves this rail is healthy; clear
+                // any accumulated error count so a previously-cooled-down
+                // rail can be used again without waiting for the full
+                // cooldown to expire. The monitor pointer is resolved once
+                // in generatePostPath, so no map lookup is needed here.
+                if (auto* rail = slice->rail_monitor; rail && rail->ready())
+                    rail->markRecovered(slice->source_dev_id,
+                                        slice->target_dev_id);
                 worker.perf.inflight_lat.add(inflight_lat);
                 worker.perf.enqueue_lat.add(enqueue_lat);
             }
@@ -449,7 +631,25 @@ int Workers::handleContextEvents(std::shared_ptr<RdmaContext>& context) {
 }
 
 void Workers::monitorThread() {
+    // Track time for periodic endpoint reclaim (1 Hz heartbeat)
+    auto last_reclaim_time = std::chrono::steady_clock::now();
+
     while (running_) {
+        // Periodic endpoint reclaim: runs every 1 second to drain waiting_list_
+        // Under failure load, insertions stall but endpoints still need cleanup
+        auto current_time = std::chrono::steady_clock::now();
+        auto time_since_last_reclaim =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                current_time - last_reclaim_time)
+                .count();
+
+        if (time_since_last_reclaim >= 1000) {  // 1 second = 1000 ms
+            for (auto& context : transport_->context_set_) {
+                context->endpointStore()->reclaim();
+            }
+            last_reclaim_time = current_time;
+        }
+
         for (auto& context : transport_->context_set_) {
             struct epoll_event event;
             if (context->eventFd() < 0) continue;
@@ -470,7 +670,7 @@ Status Workers::getRouteHint(RouteHint& hint, SegmentID segment_id,
                              uint64_t addr, uint64_t length) {
     auto& segment_manager = transport_->metadata_->segmentManager();
     CHECK_STATUS(segment_manager.withCachedSegment(
-        segment_id, [&](SegmentDesc* segment) {
+        segment_id, hint.pin, [&](SegmentDesc* segment) {
             hint.segment = segment;
             hint.buffer = segment->findBuffer(addr, length);
             if (!hint.buffer)
@@ -508,6 +708,7 @@ Status Workers::getRouteHint(RouteHint& hint, SegmentID segment_id,
     auto mem_id = hint.topo->getMemId(location);
     if (mem_id < 0) mem_id = hint.topo->getMemId(kWildcardLocation);
     hint.topo_entry = hint.topo->getMemEntry(mem_id);
+    hint.location = std::move(location);
     return Status::OK();
 }
 
@@ -524,7 +725,7 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
                                     RdmaSlice* slice) {
     auto& worker = worker_context_[tl_wid];
     if (slice->source_dev_id < 0) {
-        CHECK_STATUS(device_quota_->allocate(
+        CHECK_STATUS(device_selector_->allocate(
             slice->length, source.buffer->location, slice->source_dev_id));
     }
 
@@ -532,9 +733,10 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
         return Status::DeviceNotFound(
             "No device could access the slice memory region" LOC_MARK);
 
-    auto& rail = worker.rails[target.segment->machine_id];
+    auto& rail = getOrCreateRail(worker.rails, target.segment->machine_id);
     if (!rail.ready() || target.topo != rail.remote())
-        rail.load(source.topo, target.topo);
+        rail.load(source.topo, target.topo, rail_topo_json_,
+                  transport_->conf_.get());
     if (slice->target_dev_id < 0) {
         int mapped_dev_id = rail.findBestRemoteDevice(
             slice->source_dev_id, target.topo_entry->numa_node);
@@ -630,7 +832,8 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
             reachable = (sdev == tdev);  // loopback is safe
         } else {
             auto& worker = worker_context_[tl_wid];
-            auto& rail = worker.rails[target.segment->machine_id];
+            auto& rail =
+                getOrCreateRail(worker.rails, target.segment->machine_id);
             reachable = rail.available(sdev, tdev);
         }
 
@@ -663,6 +866,26 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
         CHECK_STATUS(selectFallbackDevice(source, target, slice));
     slice->source_lkey = source.buffer->lkey[slice->source_dev_id];
     slice->target_rkey = target.buffer->rkey[slice->target_dev_id];
+    // Cache the RailMonitor pointer so asyncPollCq / disableEndpoint can
+    // update rail state without a segment lookup or string-keyed map
+    // lookup on the hot path.
+    slice->rail_monitor = &getOrCreateRail(worker_context_[tl_wid].rails,
+                                           target.segment->machine_id);
+    if (transport_->params_->log_slice_affinity) {
+        const auto* local_nic = source.topo->getNicEntry(slice->source_dev_id);
+        const auto* remote_nic = target.topo->getNicEntry(slice->target_dev_id);
+        VLOG(1) << "RDMA slice affinity: source_location=" << source.location
+                << ", target_location=" << target.location
+                << ", local_device_name="
+                << (local_nic ? local_nic->name : "<unknown>")
+                << ", peer_device_name="
+                << (remote_nic ? remote_nic->name : "<unknown>")
+                << ", target_id=" << slice->task->request.target_id
+                << ", source_addr=" << static_cast<void*>(slice->source_addr)
+                << ", dest_addr=" << reinterpret_cast<void*>(slice->target_addr)
+                << ", length=" << slice->length
+                << ", retry_count=" << slice->retry_count;
+    }
     return Status::OK();
 }
 }  // namespace tent

@@ -2,12 +2,14 @@
 
 #include <atomic>
 #include <csignal>
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
-#include "pyclient.h"
-#include "real_client.h"
-#include "shm_helper.h"
 #include "client_metric.h"
+#include "pyclient.h"
+#include "shm_helper.h"
 #include <memory>
 
 namespace mooncake {
@@ -27,7 +29,8 @@ class DummyClient : public PyClient {
                    const std::shared_ptr<TransferEngine> &transfer_engine,
                    const std::string &ipc_socket_path,
                    bool enable_ssd_offload = false,
-                   const std::string &ssd_offload_path = "") {
+                   const std::string &ssd_offload_path = "",
+                   const std::string &tenant_id = "default") {
         // Dummy client does not support real setup
         return -1;
     };
@@ -58,8 +61,11 @@ class DummyClient : public PyClient {
         const std::vector<std::vector<std::string>> &all_keys,
         const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
-        const std::vector<std::vector<std::vector<size_t>>> &all_sizes)
-        override;
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache *query_result_cache = nullptr) override;
+
+    std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
+        const std::vector<std::string> &keys) override;
 
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,
@@ -179,6 +185,15 @@ class DummyClient : public PyClient {
     int register_shm_via_ipc(const ShmHelper::ShmSegment *shm,
                              bool is_local = false);
 
+#if defined(USE_ASCEND_DIRECT)
+    int register_device_buffer_for_reconnect(void *buffer, size_t size);
+
+    int unregister_device_buffer_for_reconnect(void *buffer);
+
+    [[nodiscard]] std::vector<ShmHelper::ShmSegment>
+    get_registered_device_buffers() const;
+#endif
+
     /**
      * @brief Generic RPC invocation helper for single-result operations
      * @tparam ServiceMethod Pointer to WrappedMasterService member function
@@ -275,6 +290,11 @@ class DummyClient : public PyClient {
     std::atomic<bool> last_ping_healthy_{false};
     void ping_thread_main();
     std::atomic<bool> connected_{false};
+
+#if defined(USE_ASCEND_DIRECT)
+    mutable std::mutex registered_device_buffers_mutex_;
+    std::unordered_map<uint64_t, size_t> registered_device_buffers_;
+#endif
 
     // Ascend physical device id for dummy-real RPC to real, set in setup_dummy
     int32_t device_id_ = 0;

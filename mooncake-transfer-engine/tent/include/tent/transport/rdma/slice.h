@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -33,20 +34,42 @@
 namespace mooncake {
 namespace tent {
 struct RdmaSlice;
+class RailMonitor;
 
 struct RdmaSliceList {
     RdmaSlice* first = nullptr;
     int num_slices = 0;
 };
 
+// Forward declarations
+class RdmaEndPoint;
+struct RdmaTask;
+
+using RdmaSliceStorage = Slab<RdmaSlice>;
+using RdmaTaskStorage = Slab<RdmaTask>;
+
 struct RdmaTask {
     int num_slices;
     Request request;
+    // Named QP pool this task's slices should use (RFC #2568 step 3). Empty =
+    // no pool selected: slices spray across all data QPs as before. Resolved
+    // from SelectionResult.qp_pool at task creation.
+    std::string qp_pool;
     volatile TransferStatusEnum status_word;
     volatile size_t transferred_bytes;
     volatile int success_slices;
     volatile int resolved_slices;
     volatile TransferStatusEnum first_error = PENDING;
+
+    // Reference counting for UAF protection
+    std::atomic<int> ref_count{0};
+
+    void ref() { ref_count.fetch_add(1, std::memory_order_relaxed); }
+    void deref() {
+        if (ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            RdmaTaskStorage::Get().deallocate(this);
+        }
+    }
 };
 
 class RdmaEndPoint;
@@ -71,9 +94,15 @@ struct RdmaSlice {
     bool failed = false;
     uint64_t enqueue_ts = 0;
     uint64_t submit_ts = 0;
+    // Non-owning pointer to the per-worker RailMonitor for this slice's
+    // target machine, resolved once in generatePostPath. Lets asyncPollCq
+    // and disableEndpoint call markRecovered / markFailed without a
+    // string-keyed map lookup on the RDMA hot path. Stable because
+    // WorkerContext::rails stores values via unique_ptr, so rehashes do
+    // not invalidate the pointee.
+    RailMonitor* rail_monitor = nullptr;
+    int priority = PRIO_HIGH;
 };
-
-using RdmaSliceStorage = Slab<RdmaSlice>;
 
 static inline void updateSliceStatus(RdmaSlice* slice,
                                      TransferStatusEnum status) {
@@ -94,6 +123,7 @@ static inline void updateSliceStatus(RdmaSlice* slice,
         if (final_st == PENDING) final_st = FAILED;
         __sync_bool_compare_and_swap(&task->status_word, PENDING, final_st);
     }
+    task->deref();
 }
 
 }  // namespace tent

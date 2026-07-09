@@ -202,11 +202,14 @@ mooncake-wheel/mooncake/transfer_engine_bench
 mooncake-ep/mooncake/
 mooncake-pg/mooncake/
 
-# Claude Code Memory
-CLAUDE.md
-
 # CodeQL
 _codeql_detected_source_root
 
 # CodeBuddy Memory
 .codebuddy/
+
+# core dumps
+core_*
+# MacOS
+.DS_Store
+.envrc

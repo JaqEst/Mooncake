@@ -43,6 +43,8 @@ class RdmaEndPoint {
         UNCONNECTED,
         CONNECTING,
         CONNECTED,
+        DESTROYING,
+        DESTROYED,
     };
 
    public:
@@ -56,6 +58,8 @@ class RdmaEndPoint {
    private:
     int reconstruct();
     int deconstruct();
+    int deconstructLocked();
+    void beginDestroyLocked();
 
    public:
     void setPeerNicPath(const std::string &peer_nic_path);
@@ -70,8 +74,6 @@ class RdmaEndPoint {
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
     int setupConnectionsByPassive(const HandShakeDesc &peer_desc,
                                   HandShakeDesc &local_desc);
-
-    bool hasOutstandingSlice() const;
 
     bool active() const { return active_; }
 
@@ -91,6 +93,11 @@ class RdmaEndPoint {
         return status_.load(std::memory_order_relaxed) == CONNECTED;
     }
 
+    bool retired() const {
+        auto status = status_.load(std::memory_order_relaxed);
+        return status == DESTROYING || status == DESTROYED;
+    }
+
     // Interrupts the connection, which can be triggered by user or by internal
     // error. Use setupConnectionsByActive or setupConnectionsByPassive to
     // reconnect
@@ -99,28 +106,21 @@ class RdmaEndPoint {
     // Destroy QPs before CQs (in RDMA Context)
     int destroyQP();
 
+    // Two-phase QP destruction to avoid use-after-free in concurrent
+    // submitPostSend. Phase 1 (beginDestroy): sets active_=false and
+    // status_=DESTROYING, transitions QPs to ERR state so hardware flushes
+    // inflight WRs to CQ. Does not block. Phase 2 (finishDestroy): called
+    // after all outstanding WRs have been drained (wr_depth_list_ all zero),
+    // actually destroys QPs and frees resources. Returns true if destruction
+    // is complete, false if outstanding WRs remain.
+    void beginDestroy();
+    bool finishDestroy();
+
    private:
     int disconnectUnlocked();
 
-    // Resets the connection.
-    //
-    // The main difference between this function and `disconnectUnlocked`
-    // is that it will reconstruct QPs when `CONFIG_ERDMA` is defined.
-    // Without `CONFIG_ERDMA`, it is essentially the same as
-    // `disconnectUnlocked` but with additional logging.
-    //
-    // This serves as a workaround for Aliyun eRDMA devices (i.e., once a QP is
-    // transitioned to the RTS state, it cannot be reset to RTS again directly).
-    // For more details:
-    // https://github.com/kvcache-ai/Mooncake/pull/1733#discussion_r2992088663
-    //
-    // In practice:
-    // - Call `resetConnection` if the QPs' state may have transitioned to RTS.
-    // - Call `disconnectUnlocked` otherwise.
-    //
-    // This is mainly used in `setupConnectionsByActive` or
-    // `setupConnectionsByPassive`. It is NOT invoked in the normal execution
-    // flow, so a `reason` argument is passed for internal logging purposes.
+    // Resets only pre-connected handshake attempts. Once an endpoint has ever
+    // reached CONNECTED, it is retired instead of being reused.
     int resetConnection(const std::string &reason);
 
    public:
@@ -137,15 +137,31 @@ class RdmaEndPoint {
     size_t getQPNumber() const;
 
    private:
+    enum class SetupConnectionFailureStage {
+        kNone,
+        kPeerValidation,
+        kReset,
+        kInit,
+        kRtr,
+        kRts,
+    };
+
+    struct SetupConnectionFailureInfo {
+        SetupConnectionFailureStage stage = SetupConnectionFailureStage::kNone;
+        int sys_errno = 0;
+    };
+
     std::vector<uint32_t> qpNum() const;
 
     int doSetupConnection(const std::string &peer_gid, uint16_t peer_lid,
                           std::vector<uint32_t> peer_qp_num_list,
-                          std::string *reply_msg = nullptr);
+                          std::string *reply_msg = nullptr,
+                          SetupConnectionFailureInfo *failure_info = nullptr);
 
-    int doSetupConnection(int qp_index, const std::string &peer_gid,
+    int doSetupConnection(int qp_index, const ibv_gid &peer_gid,
                           uint16_t peer_lid, uint32_t peer_qp_num,
-                          std::string *reply_msg = nullptr);
+                          int local_gid_index, std::string *reply_msg = nullptr,
+                          SetupConnectionFailureInfo *failure_info = nullptr);
 
    private:
     static constexpr uint64_t kWaitExistingHandshakeTimeoutNano =
@@ -153,6 +169,16 @@ class RdmaEndPoint {
     static constexpr uint32_t kWaitExistingHandshakeSpinCount = 500;
     static constexpr uint32_t kWaitExistingHandshakeInitialSleepUs = 50;
     static constexpr uint32_t kWaitExistingHandshakeMaxSleepUs = 2000;
+
+    // Maximum time (in seconds) to wait for outstanding WRs to drain in
+    // finishDestroy before forcing QP destruction. This guards against
+    // ibv_modify_qp-to-ERR failures that prevent WR flushing.
+    static constexpr double kFinishDestroyTimeoutSec = 30.0;
+
+    // Maximum number of deconstructLocked retries in finishDestroy before
+    // giving up and marking the endpoint as DESTROYED. Prevents infinite
+    // retry loops and log flooding when ibv_destroy_qp fails permanently.
+    static constexpr int kFinishDestroyMaxRetries = 3;
 
     RdmaContext &context_;
     std::atomic<Status> status_;
@@ -162,6 +188,7 @@ class RdmaEndPoint {
 
     std::string peer_nic_path_;
     std::vector<uint32_t> peer_qp_num_list_;
+    bool has_connected_;
 
     volatile int *wr_depth_list_;
     int max_wr_depth_;
@@ -171,6 +198,7 @@ class RdmaEndPoint {
     volatile bool active_;
     volatile int *cq_outstanding_;
     volatile uint64_t inactive_time_;
+    int finish_destroy_retries_ = 0;
 };
 
 }  // namespace mooncake
