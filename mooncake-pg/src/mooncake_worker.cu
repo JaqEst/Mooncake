@@ -63,7 +63,7 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
     for (size_t elem_idx = thread_idx; elem_idx < numElements;
          elem_idx += stride) {
         bool valid = false;
-        acc_t acc = 0;
+        acc_t acc{0};
         for (size_t rank = 0; rank < numRanks; ++rank) {
             if (activeRanks[rank]) {
                 if (!valid) {

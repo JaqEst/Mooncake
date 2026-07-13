@@ -128,7 +128,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("extend_group_size_to", &extendGroupSizeTo);
     m.def("get_peer_state", &getPeerState);
     m.def("recover_ranks", &recoverRanks);
-    m.def("get_group_size", &getGroupSize);
     m.def("join_group", &joinGroup);
 
     py::class_<MooncakeBackend::MooncakeBackendOptions,

@@ -8,7 +8,9 @@
 #include <thread>
 #include <mooncake_worker.cuh>
 #include <mooncake_worker_kernels.cuh>
-#include <ATen/cuda/CUDAGraphsUtils.cuh>
+#include <c10/core/Event.h>
+#include <paddle_c10d_compat/future.h>
+#include <omp.h>
 
 #include "pg_utils.h"
 
@@ -93,8 +95,9 @@ class MooncakeWorkCuda : public ::c10d::Work {
         // waitUntilTasksSubmitted is totally unnecessary, but we keep it for
         // uniform behavior to avoid invasive changes to TE/TENT.
         bool submitted = true;
-        if (at::cuda::currentStreamCaptureStatus() ==
-            c10::cuda::CaptureStatus::None) {
+        cudaStreamCaptureStatus status{cudaStreamCaptureStatusNone};
+        C10_CUDA_CHECK(cudaStreamIsCapturing(c10::cuda::getCurrentCUDAStream(), &status));
+        if (status == cudaStreamCaptureStatusNone) {
             // Normal execution: block until tasks are submitted.
             submitted =
                 worker_->waitUntilTasksSubmitted(submitted_tasks_, timeout);
@@ -141,8 +144,9 @@ class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
     bool wait(std::chrono::milliseconds timeout) override {
         // Skip host-side synchronization during CUDA graph capture.
         // cudaEventSynchronize is not permitted while a stream is capturing.
-        if (at::cuda::currentStreamCaptureStatus() !=
-            c10::cuda::CaptureStatus::None) {
+        cudaStreamCaptureStatus status{cudaStreamCaptureStatusNone};
+        C10_CUDA_CHECK(cudaStreamIsCapturing(c10::cuda::getCurrentCUDAStream(), &status));
+        if (status != cudaStreamCaptureStatusNone) {
             // We still need stream-level synchronization so that subsequent
             // operations on the capture stream are ordered after the barrier
             // task on the enqueue stream.
@@ -209,8 +213,7 @@ void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                                     activeRanks, stream);
             break;
         default:
-            TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
-                                        dst.scalar_type()));
+            TORCH_CHECK(false, "Unsupported reduce dtype: ", dst.scalar_type());
     }
 }
 
@@ -226,31 +229,30 @@ T applyReduceOp(const T& a, const T& b, c10d::ReduceOp op) {
         case c10d::ReduceOp::MAX:
             return std::max(a, b);
         default:
-            TORCH_CHECK(false, c10::str("Unsupported reduce op: ", op));
+            TORCH_CHECK(false, "Unsupported reduce op: ", op);
     }
 }
 
 template <typename T>
 void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
                c10d::ReduceOp op, bool* activeRanks) {
-    at::parallel_for(0, numElements, 1024, [&](int64_t begin, int64_t end) {
-        for (int64_t i = begin; i < end; ++i) {
-            bool valid = false;
-            T acc{};
-            for (int64_t rank = 0; rank < numRanks; ++rank) {
-                if (activeRanks[rank]) {
-                    if (!valid) {
-                        acc = src[i + rank * numElements];
-                        valid = true;
-                    } else {
-                        acc =
-                            applyReduceOp(acc, src[i + rank * numElements], op);
-                    }
+    #pragma omp parallel for
+    for (int64_t i = 0; i < static_cast<int64_t>(numElements); ++i) {
+        bool valid = false;
+        T acc{};
+        for (int64_t rank = 0; rank < numRanks; ++rank) {
+            if (activeRanks[rank]) {
+                if (!valid) {
+                    acc = src[i + rank * numElements];
+                    valid = true;
+                } else {
+                    acc =
+                        applyReduceOp(acc, src[i + rank * numElements], op);
                 }
             }
-            dst[i] = acc;
         }
-    });
+        dst[i] = acc;
+    }
 }
 
 void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
@@ -289,8 +291,7 @@ void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
             reduceCpu((bool*)ptr, (bool*)src, num, numRanks, op, activeRanks);
             break;
         default:
-            TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
-                                        dst.scalar_type()));
+            TORCH_CHECK(false, "Unsupported reduce dtype: ", dst.scalar_type());
     }
 }
 

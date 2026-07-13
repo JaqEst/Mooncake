@@ -44,7 +44,7 @@ class MooncakePGAdapter:
     barrier(device_id)                          barrier(BarrierOptions)
     send(t, dst, sync_op)                      send([t], dst)
     recv(t, src, sync_op)                      recv([t], src)
-    name()                                     mc_group.get_backend_name()
+    name()                                     mc_group.name()
     rank()                                     mc_group.rank()
     size()                                     mc_group.size()
     """
@@ -53,7 +53,7 @@ class MooncakePGAdapter:
         self._mc = mc_group
 
     def name(self) -> str:
-        return self._mc.get_backend_name()
+        return self._mc.name()
 
     def rank(self) -> int:
         return self._mc.rank()
@@ -131,12 +131,12 @@ class MooncakePGAdapter:
         opts = pg.ReduceScatterOptions()
         opts.reduce_op = _map_reduce_op(op)
         opts.async_op = not sync_op
-        return self._mc._reduce_scatter_base(out_tensor, in_list, opts)
+        return self._mc.reduce_scatter([out_tensor], [in_list], opts)
 
     def reduce_scatter_on_calc_stream(self, out_tensor, in_list, op):
         opts = pg.ReduceScatterOptions()
         opts.reduce_op = _map_reduce_op(op)
-        work = self._mc._reduce_scatter_base(out_tensor, in_list, opts)
+        work = self._mc.reduce_scatter([out_tensor], [in_list], opts)
         work.wait()
         return work
 
@@ -190,25 +190,58 @@ class MooncakePGAdapter:
         pass
 
 
-def make_paddle_group(mc_group, group_id: int):
+def mooncake_backend_options(
+    world_size: int,
+    *,
+    active_value: int = 0,
+    is_extension: bool = False,
+    max_world_size: int | None = None,
+) -> pg.MooncakeBackendOptions:
+    tensor_size = world_size if max_world_size is None else int(max_world_size)
+    active_ranks = paddle.full(
+        (tensor_size,),
+        int(active_value),
+        dtype=paddle.int32,
+    )
+    if max_world_size is None:
+        if is_extension:
+            return pg.MooncakeBackendOptions(active_ranks, True)
+        return pg.MooncakeBackendOptions(active_ranks)
+    return pg.MooncakeBackendOptions(active_ranks, bool(is_extension), tensor_size)
+
+
+def make_paddle_group(mc_group, ranks: list, group_id: int):
     return Group(
         rank_in_group=mc_group.rank(),
         id=group_id,
-        ranks=mc_group.global_ranks,
+        ranks=ranks,
         pg=MooncakePGAdapter(mc_group),
-        name=mc_group.get_backend_name(),
+        name=mc_group.name(),
     )
 
 
-def new_mooncake_group(ranks: list, group_id: int):
-    pg_opts = ep.MooncakeBackendOptions(
-        paddle.zeros((len(ranks),), dtype=paddle.int32)
+def new_mooncake_group(
+    ranks: list,
+    group_id: int,
+    is_extension: bool = False,
+    active_value: int | None = None,
+    max_world_size: int | None = None,
+) -> Group:
+    resolved_active_value = (
+        1 if is_extension else 0 if active_value is None else active_value
     )
+    pg_opts = mooncake_backend_options(
+        len(ranks),
+        active_value=resolved_active_value,
+        is_extension=is_extension,
+        max_world_size=max_world_size
+    )
+
     group = dist.new_group(
-        ranks, backend="mooncake", pg_options=pg_opts
+        ranks, backend="mooncake", pg_options=pg_opts, group_id=str(group_id)
     )
 
-    group = make_paddle_group(group, group_id=group_id)
+    group = make_paddle_group(group, ranks=ranks, group_id=group_id)
 
     group_name = _col._default_group_name + str(group_id)
     _col._group_map_by_name[group_name] = group
@@ -226,6 +259,9 @@ def init_mooncake_pg(
     clean_existed_groups: bool = False,
     ib_device_filter: List = None,
     host_ip: str = None,
+    is_extension: bool = False,
+    active_value: int | None = None,
+    max_world_size: int | None = None,
     logger: Any = None
 ) -> None:
     if host_ip:
@@ -234,14 +270,22 @@ def init_mooncake_pg(
     if ib_device_filter:
         dist.set_device_filter(ib_device_filter)
 
+    resolved_active_value = (
+        1 if is_extension else 0 if active_value is None else active_value
+    )
+    pg_opts = mooncake_backend_options(
+        world_size,
+        active_value=resolved_active_value,
+        is_extension=is_extension,
+        max_world_size=max_world_size
+    )
+
     dist.init_process_group(
         backend="mooncake",
         store=_col._default_store,
         rank=rank,
         world_size=world_size,
-        pg_options=pg.MooncakeBackendOptions(
-            paddle.zeros((world_size,), dtype=paddle.int32)
-        ),
+        pg_options=pg_opts
     )
 
     if logger is not None:
@@ -261,7 +305,7 @@ def init_mooncake_pg(
 
         destroy_process_group() # destory all existed groups
 
-        world_group = make_paddle_group(dist._default_pg, group_id=0)
+        world_group = make_paddle_group(dist._default_pg, ranks=list(range(world_size)), group_id=0)
 
         _col._group_map_by_name[_col._default_group_name] = world_group
         _col._group_map[0] = world_group

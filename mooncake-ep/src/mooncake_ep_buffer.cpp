@@ -466,6 +466,16 @@ torch::Tensor MooncakeEpBuffer::get_next_combine_buffer(
         torch::TensorOptions().dtype(dtype).device(torch::kCUDA));
 }
 
+bool MooncakeEpBuffer::use_fast_path() {
+    if (!ibgda_disabled_) return true;
+    bool p2p_all = p2p_transport_ && p2p_transport_->allPeersAccessible();
+    if (!p2p_all) {
+        LOG(WARNING) << "IBGDA unavailable and P2P not fully accessible. "
+                        << "Using fallback (degraded performance).";
+    }
+    return p2p_all;
+}
+
 void MooncakeEpBuffer::update_local_qpns() {
     if (!rdma_transport_) return;
     int ret = rdma_transport_->recreateQueuePairs(comm_stream.stream());

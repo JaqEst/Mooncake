@@ -1,7 +1,7 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/ops/tensor.h>
 #include <cuda_alike.h>
 #include <torch/torch.h>
-#include <paddle_c10d_compat/backend.h>
 #include <mooncake_backend.h>
 #include <p2p_proxy.h>
 #include <thread>
@@ -330,7 +330,7 @@ MooncakeBackend::MooncakeBackend(
         TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
 
-    auto& dev_worker_mgr = P2PDeviceWorkerManager::GetInstance();
+    auto& dev_worker_mgr = P2PDeviceWorkerManager::getInstance();
     int cuda_device_index = isCpu_ ? -1 : phi::backends::gpu::GetCurrentDeviceId();
 
     if (isCpu_)

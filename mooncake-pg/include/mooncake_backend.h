@@ -58,7 +58,7 @@ class MooncakeP2PShim final : public ::c10d::Backend {
 
 class MooncakeBackend final : public ::c10d::ProcessGroup {
    public:
-    struct MooncakeBackendOptions final : torch::CustomClassHolder {
+    struct MooncakeBackendOptions {
         explicit MooncakeBackendOptions(at::Tensor activeRanks)
             : activeRanks_{activeRanks} {}
         MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension)
@@ -69,7 +69,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
               isExtension_{isExtension},
               maxWorldSize_{maxWorldSize} {}
 
-        ~MooncakeBackendOptions() override = default;
+        virtual ~MooncakeBackendOptions() = default;
 
         at::Tensor activeRanks_;
         bool isExtension_ = false;

@@ -132,15 +132,7 @@ struct MooncakeEpBuffer {
     }
 
     // Fast-path: IBGDA available, or all peers accessible via P2P.
-    bool use_fast_path() {
-        if (!ibgda_disabled_) return true;
-        bool p2p_all = p2p_transport_ && p2p_transport_->allPeersAccessible();
-        if (!p2p_all) {
-            LOG(WARNING) << "IBGDA unavailable and P2P not fully accessible. "
-                         << "Using fallback (degraded performance).";
-        }
-        return p2p_all;
-    }
+    bool use_fast_path();
 
     // Recreate QPs (called when active_ranks changes).
     void update_local_qpns();

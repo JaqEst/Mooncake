@@ -39,6 +39,14 @@ class Backend {
   int getRank() const { return rank_; }
   int getSize() const { return size_; }
 
+  int64_t getID() const {
+    return reinterpret_cast<std::intptr_t>(this);
+  }
+
+  virtual bool supportsCoalescing() const {
+    return false;
+  }
+
   virtual const std::string getBackendName() const {
     TORCH_INTERNAL_ASSERT(false, "getBackendName() is not implemented.");
   }
@@ -56,6 +64,12 @@ class Backend {
   virtual c10::intrusive_ptr<Work> recv(std::vector<at::Tensor>& /* tensors */,
                                         int /* srcRank */, int /* tag */) {
     TORCH_CHECK(false, "Backend ", getBackendName(), " does not support recv.");
+  }
+
+  virtual c10::intrusive_ptr<Work> recvAnysource(
+      std::vector<at::Tensor>& /* tensors */,
+      int /* tag */) {
+    TORCH_CHECK(false, "Backend ", getBackendName(), " does not support recvAnysource.");
   }
 
   virtual c10::intrusive_ptr<Work> broadcast(
