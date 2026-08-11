@@ -341,13 +341,8 @@ def batch_isend_irecv(p2p_op_list: List) -> List:
         List of Work objects
     """
     works = []
-    for op in p2p_op_list:
-        if op.op_type == "send":
-            work = isend(op.tensor, op.peer, op.group, op.tag)
-        elif op.op_type == "recv":
-            work = irecv(op.tensor, op.peer, op.group, op.tag)
-        else:
-            raise ValueError(f"Unknown P2P operation type: {op.op_type}")
+    for p2p_op in p2p_op_list:
+        work = p2p_op.op(p2p_op.tensor, p2p_op.peer, p2p_op.group, p2p_op.tag)
         works.append(work)
     return works
 
@@ -451,7 +446,7 @@ def all_gather_into_tensor(output_tensor, input_tensor, group=None, async_op: bo
     group = _get_group(group)
     opts = AllgatherOptions()
     opts.async_op = async_op
-    work = group.allgather([output_tensor], [input_tensor], opts)
+    work = group._allgather_base(output_tensor, input_tensor, opts)
 
     if async_op:
         return work
@@ -759,16 +754,16 @@ def _new_process_group_helper(backend, store, rank, world_size, timeout, group_i
 class P2POp:
     """Wrapper for point-to-point operations used with batch_isend_irecv."""
 
-    def __init__(self, op_type: str, tensor, peer: int, group=None, tag: int = 0):
+    def __init__(self, op: callable, tensor, peer: int, group=None, tag: int = 0):
         """
         Args:
-            op_type: "send" or "recv"
+            op: dist.isend or dis.irecv
             tensor: Tensor to send or receive
             peer: Destination rank (for send) or source rank (for recv)
             group: Process group
             tag: Message tag
         """
-        self.op_type = op_type
+        self.op = op
         self.tensor = tensor
         self.peer = peer
         self.group = group

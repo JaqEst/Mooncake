@@ -1,6 +1,6 @@
 import os
 import torch
-import mooncake.distributed as dist
+import torch.distributed as dist
 from typing import Any, Callable, List, Tuple, Optional, Union
 
 
@@ -173,17 +173,17 @@ class Buffer:
         if not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
 
-            raddr = torch.tensor([raddr], dtype=torch.int64)
+            raddr = torch.tensor([raddr], dtype=torch.int64, device="cuda")
             raddrs = [
-                torch.empty(1, dtype=torch.int64)
+                torch.empty(1, dtype=torch.int64, device="cuda")
                 for _ in range(self.group_size)
             ]
             dist.all_gather(raddrs, raddr, self.group)
             raddrs = torch.cat(raddrs).tolist()
 
-            rkey = torch.tensor([rkey], dtype=torch.int32)
+            rkey = torch.tensor([rkey], dtype=torch.int32, device="cuda")
             rkeys = [
-                torch.empty(1, dtype=torch.int32)
+                torch.empty(1, dtype=torch.int32, device="cuda")
                 for _ in range(self.group_size)
             ]
             dist.all_gather(rkeys, rkey, self.group)
@@ -197,13 +197,13 @@ class Buffer:
             local_qpns = self.runtime.get_local_qpns()
             local_qpns = list(
                 torch.unbind(
-                    torch.tensor(local_qpns, dtype=torch.int32).view(
+                    torch.tensor(local_qpns, dtype=torch.int32, device="cuda").view(
                         -1, all_to_all_size
                     )
                 )
             )
             remote_qpns = [
-                torch.empty(all_to_all_size, dtype=torch.int32)
+                torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
                 for _ in range(self.group_size)
             ]
             dist.all_to_all(remote_qpns, local_qpns, self.group)
@@ -564,7 +564,8 @@ class Buffer:
                         num_max_dispatch_tokens_per_rank * self.group_size,
                         hidden,
                     ),
-                    dtype=torch.bfloat16
+                    dtype=torch.bfloat16,
+                    device="cuda",
                 )
             return self._fallback_next_combine_buffer
         return self.runtime.get_next_combine_buffer(
