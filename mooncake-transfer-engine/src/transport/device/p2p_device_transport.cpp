@@ -181,11 +181,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
         if (available_table_) cudaFree(available_table_);
         if (peer_ptrs_dev_) cudaFree(peer_ptrs_dev_);
         if (peer_ptrs_host_) {
-            for (int i = 0; i < num_ranks_; ++i) {
-                if (peer_ptrs_host_[i] && peer_ptrs_host_[i] != local_ptr_) {
-                    cudaIpcCloseMemHandle(peer_ptrs_host_[i]);
-                }
-            }
+            closeImportedPeerHandles();
             cudaFreeHost(peer_ptrs_host_);
         }
     }
@@ -280,6 +276,8 @@ class P2pDeviceTransportImpl : public P2pTransport {
         void* local_ptr, int rank, int num_ranks,
         const std::vector<std::vector<int32_t>>& remote_handles,
         const std::vector<int>& active_ranks_mask) override {
+        closeImportedPeerHandles();
+
         local_ptr_ = local_ptr;
         int device_id = 0;
         cudaGetDevice(&device_id);
@@ -497,6 +495,21 @@ class P2pDeviceTransportImpl : public P2pTransport {
     }
 
    private:
+    void closeImportedPeerHandles() {
+        if (!peer_ptrs_host_) return;
+        for (int i = 0; i < num_ranks_; ++i) {
+            void* ptr = peer_ptrs_host_[i];
+            if (!ptr) continue;
+            peer_ptrs_host_[i] = nullptr;
+            if (ptr == local_ptr_) continue;
+            cudaError_t err = cudaIpcCloseMemHandle(ptr);
+            if (err != cudaSuccess) {
+                LOG(WARNING) << "[EP P2P] failed to close IPC handle for rank "
+                             << i << ": " << cudaGetErrorString(err);
+            }
+        }
+    }
+
     int num_ranks_;
     void* local_ptr_ = nullptr;
     int32_t* available_table_ = nullptr;
