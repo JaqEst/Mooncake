@@ -7,33 +7,24 @@ import numpy as np
 from typing import Optional
 
 import paddle
-paddle.enable_compat(scope={"mooncake"})
-import mooncake.distributed as dist
-from mooncake import pg
+import paddle.distributed as dist
+
+from pg_test_utils import init_world_group
 
 
 def init_dist(local_rank: int, num_local_ranks: int):
     # NOTES: you may rewrite this function with your own cluster settings
-    ip = os.getenv('MASTER_ADDR', '127.0.0.1')
-    port = int(os.getenv('MASTER_PORT', '8361'))
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
     node_rank = int(os.getenv('RANK', 0))
     assert (num_local_ranks < 8 and num_nodes == 1) or num_local_ranks == 8
 
-    paddle.cuda.set_device(local_rank)
-    dist.init_process_group(
-        backend='mooncake',
-        init_method=f'tcp://{ip}:{port}',
-        world_size=num_nodes * num_local_ranks,
-        rank=node_rank * num_local_ranks + local_rank,
-        pg_options=pg.MooncakeBackendOptions(
-            paddle.zeros((num_nodes * num_local_ranks,),
-                         dtype=paddle.int32))
-    )
-    paddle.set_default_dtype(paddle.bfloat16)
-    paddle.set_default_device(f'cuda:{local_rank}')
+    num_ranks = num_nodes * num_local_ranks
+    rank = node_rank * num_local_ranks + local_rank
+    group = init_world_group(rank, num_ranks, device_id=local_rank)
 
-    return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes))), dist.new_group(list(range(num_local_ranks * num_nodes)), backend="mooncake-cpu")
+    paddle.set_default_dtype(paddle.bfloat16)
+
+    return rank, num_ranks, group
 
 
 def calc_diff(x: paddle.Tensor, y: paddle.Tensor):

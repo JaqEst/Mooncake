@@ -3,15 +3,15 @@ import multiprocessing as mp
 from functools import partial
 
 import paddle
-paddle.enable_compat(scope={"mooncake"})
-import mooncake.distributed as dist
+import paddle.distributed as dist
+from paddle.distributed.communication.group import Group
 
-from mooncake.mooncake_ep_buffer import Buffer
+from mooncake.integration.paddle import Buffer
 from ep_test_utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
 
 
 def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
-              rank: int, num_ranks: int, group: dist.ProcessGroup, cpu_group: dist.ProcessGroup, buffer: Buffer, seed: int = 0):
+              rank: int, num_ranks: int, group: Group, buffer: Buffer, seed: int = 0):
     paddle.manual_seed(seed + rank)
     random.seed(seed + rank)
 
@@ -48,7 +48,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
             simulated_gemm_x = per_token_cast_back(packed_recv_x[0].view(-1, hidden), packed_recv_x[1].view(-1, hidden // 128)).view(packed_recv_x[0].shape) \
                 if dispatch_use_fp8 else packed_recv_x.clone()
             all_topk_idx = paddle.empty((num_ranks, num_tokens, num_topk), dtype=topk_idx.dtype)
-            dist.all_gather_into_tensor(all_topk_idx, topk_idx, group=group)
+            dist.stream.all_gather(all_topk_idx, topk_idx, group=group)
             for i in range(num_local_experts if do_check else 0):
                 expert_id = rank * num_local_experts + i
                 recv_x = per_token_cast_back(packed_recv_x[0][i], packed_recv_x[1][i]) if dispatch_use_fp8 else packed_recv_x[i]
@@ -137,7 +137,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     # Skip profiling in fallback mode as kernels are Python functions, not CUDA kernels
     if not buffer._use_fallback:
         for return_recv_hook in (False, True):
-            cpu_group.barrier()
+            dist.barrier(group=group)
             dispatch_t, combine_t = bench_kineto(partial(test_func, zero_copy=True, return_recv_hook=return_recv_hook),
                                                  kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
                                                  suppress_kineto_output=True)
@@ -164,7 +164,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
 
 # noinspection PyUnboundLocalVariable
 def test_loop(local_rank: int, num_local_ranks: int):
-    rank, num_ranks, group, cpu_group = init_dist(local_rank, num_local_ranks)
+    rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
     num_tokens, hidden, num_topk, num_experts = 128, 7168, 8, 288
 
     num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(num_tokens, hidden, num_ranks, num_experts)
@@ -177,15 +177,15 @@ def test_loop(local_rank: int, num_local_ranks: int):
     else:
         buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
 
-    test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, cpu_group, buffer, seed=1)
+    test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=1)
 
     do_pressure_test = False
     for seed in range(int(1e9) if do_pressure_test else 0):
         if local_rank == 0:
             print(f'Testing with seed {seed} ...', flush=True)
-        ref_hash = test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, cpu_group, buffer, seed=seed)
+        ref_hash = test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=seed)
         for i in range(20):
-            assert test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, cpu_group, buffer, seed=seed) == ref_hash, f'Error: seed={seed}'
+            assert test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=seed) == ref_hash, f'Error: seed={seed}'
 
     # Cleanup with error handling (TCPStore warnings are expected in mooncake backend)
     try:

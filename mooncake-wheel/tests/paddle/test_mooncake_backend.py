@@ -4,43 +4,36 @@ import unittest
 import multiprocessing as mp
 
 import paddle
-paddle.enable_compat(scope={"mooncake"})
-import mooncake.distributed as dist
-from mooncake import pg
+import paddle.distributed as dist
+
+from pg_test_utils import device_count, init_world_group
 
 
 def worker(rank, world_size, results, collective):
-    paddle.cuda.set_device(f'cuda:{rank}')
-
-    dist.init_process_group(
-        backend="mooncake",
-        rank=rank,
-        world_size=world_size,
-        pg_options=pg.MooncakeBackendOptions(paddle.zeros((world_size,), dtype=paddle.int32)),
-    )
+    init_world_group(rank, world_size)
 
     if collective == "all_reduce_sum":
-        tensor = paddle.tensor([rank + 1], dtype=paddle.int32)
+        tensor = paddle.to_tensor([rank + 1], dtype=paddle.int32)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         results[rank] = tensor.item()
 
     elif collective == "all_reduce_product":
-        tensor = paddle.tensor([2], dtype=paddle.int32)
-        dist.all_reduce(tensor, op=dist.ReduceOp.PRODUCT)
+        tensor = paddle.to_tensor([2], dtype=paddle.int32)
+        dist.all_reduce(tensor, op=dist.ReduceOp.PROD)
         results[rank] = tensor.item()
 
     elif collective == "all_reduce_min":
-        tensor = paddle.tensor([rank + 10], dtype=paddle.int32)
+        tensor = paddle.to_tensor([rank + 10], dtype=paddle.int32)
         dist.all_reduce(tensor, op=dist.ReduceOp.MIN)
         results[rank] = tensor.item()
 
     elif collective == "all_reduce_max":
-        tensor = paddle.tensor([rank + 10], dtype=paddle.int32)
+        tensor = paddle.to_tensor([rank + 10], dtype=paddle.int32)
         dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
         results[rank] = tensor.item()
 
     elif collective == "all_gather":
-        tensor = paddle.tensor([rank])
+        tensor = paddle.to_tensor([rank], dtype=paddle.int32)
         gathered = [paddle.zeros_like(tensor) for _ in range(world_size)]
         dist.all_gather(gathered, tensor)
         results[rank] = [t.item() for t in gathered]
@@ -50,7 +43,7 @@ def worker(rank, world_size, results, collective):
         results[rank] = "ok"
 
     elif collective == "gather":
-        tensor = paddle.tensor([rank], dtype=paddle.int32)
+        tensor = paddle.to_tensor([rank], dtype=paddle.int32)
         if rank == 0:
             gather_list = [paddle.zeros_like(tensor) for _ in range(world_size)]
             dist.gather(tensor, gather_list, dst=0)
@@ -60,16 +53,18 @@ def worker(rank, world_size, results, collective):
             results[rank] = None
 
     elif collective == "scatter":
-        tensor = paddle.zeros(1, dtype=paddle.int32)
+        tensor = paddle.zeros([1], dtype=paddle.int32)
         if rank == 0:
-            scatter_list = [paddle.tensor([i], dtype=paddle.int32) for i in range(world_size)]
+            scatter_list = [
+                paddle.to_tensor([i], dtype=paddle.int32) for i in range(world_size)
+            ]
             dist.scatter(tensor, scatter_list, src=0)
         else:
             dist.scatter(tensor, src=0)
         results[rank] = tensor.item()
 
     elif collective == "reduce":
-        tensor = paddle.tensor([1], dtype=paddle.int32)
+        tensor = paddle.to_tensor([1], dtype=paddle.int32)
         dist.reduce(tensor, dst=0, op=dist.ReduceOp.SUM)
         if rank == 0:
             results[rank] = tensor.item()
@@ -91,14 +86,13 @@ class TestMooncakeBackend(unittest.TestCase):
         mp.set_start_method('spawn')
 
     def setUp(self):
-        self.world_size = paddle.cuda.device_count()
+        self.world_size = device_count()
+        if self.world_size < 2:
+            self.skipTest("Mooncake paddle backend tests need at least 2 GPUs")
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
 
-    def tearDown(self):
-        pass
-
-    def _spawn_and_check(self, collective, expected_fn):
+    def _spawn(self, collective):
         mp_manager = mp.Manager()
         results = mp_manager.dict()
 
@@ -113,7 +107,12 @@ class TestMooncakeBackend(unittest.TestCase):
 
         for p in processes:
             p.join()
+            self.assertEqual(p.exitcode, 0)
 
+        return results
+
+    def _spawn_and_check(self, collective, expected_fn):
+        results = self._spawn(collective)
         expected = expected_fn(self.world_size)
         for r in range(self.world_size):
             self.assertEqual(results[r], expected)
@@ -144,63 +143,21 @@ class TestMooncakeBackend(unittest.TestCase):
     def test_gather(self):
         # Expected gather (Root) = [0, 1, 2, ..., size-1]
         # Expected gather (Others) = None
-        mp_manager = mp.Manager()
-        results = mp_manager.dict()
-
-        processes = []
-        for rank in range(self.world_size):
-            p = mp.Process(
-                target=worker,
-                args=(rank, self.world_size, results, "gather")
-            )
-            p.start()
-            processes.append(p)
-
-        for p in processes:
-            p.join()
-
+        results = self._spawn("gather")
         self.assertEqual(results[0], list(range(self.world_size)))
         for r in range(1, self.world_size):
             self.assertIsNone(results[r])
 
     def test_scatter(self):
         # Expected scatter (Rank i) = i
-        mp_manager = mp.Manager()
-        results = mp_manager.dict()
-
-        processes = []
-        for rank in range(self.world_size):
-            p = mp.Process(
-                target=worker,
-                args=(rank, self.world_size, results, "scatter")
-            )
-            p.start()
-            processes.append(p)
-
-        for p in processes:
-            p.join()
-
+        results = self._spawn("scatter")
         for r in range(self.world_size):
             self.assertEqual(results[r], r)
 
     def test_reduce(self):
         # Expected reduce (Root) = sum([1, 1, ..., 1]) = size
         # Expected reduce (Others) = None
-        mp_manager = mp.Manager()
-        results = mp_manager.dict()
-
-        processes = []
-        for rank in range(self.world_size):
-            p = mp.Process(
-                target=worker,
-                args=(rank, self.world_size, results, "reduce")
-            )
-            p.start()
-            processes.append(p)
-
-        for p in processes:
-            p.join()
-
+        results = self._spawn("reduce")
         self.assertEqual(results[0], self.world_size)
         for r in range(1, self.world_size):
             self.assertIsNone(results[r])
