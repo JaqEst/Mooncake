@@ -20,6 +20,7 @@ def _map_reduce_op(paddle_op):
 def _mooncake_backend_options(
     world_size: int,
     *,
+    device: str = "gpu",
     active_value: int = 0,
     is_extension: bool = False,
     max_world_size: int | None = None,
@@ -29,6 +30,7 @@ def _mooncake_backend_options(
         (tensor_size,),
         int(active_value),
         dtype=paddle.int32,
+        device=device,
     )
     if max_world_size is None:
         return pg.MooncakeBackendOptions(active_ranks, is_extension)
@@ -54,11 +56,13 @@ class ProcessGroupMooncake:
         prefix_store = pg.PrefixStore(str(group_id), store)
 
         # Mooncake backend options
+        device = pg_options.get('device', "gpu")
         active_value = pg_options.get('active_value', 0)
         is_extension = pg_options.get('is_extension', False)
         max_world_size = pg_options.get('max_world_size', None)
         back_opts = _mooncake_backend_options(
             world_size,
+            device=device,
             active_value=active_value,
             is_extension=is_extension,
             max_world_size=max_world_size
@@ -76,7 +80,12 @@ class ProcessGroupMooncake:
         dist_opts.group_id = str(group_id)
         dist_opts.global_ranks_in_group = global_ranks_in_group
 
-        backend = pg.createMooncakeBackend(dist_opts, back_opts)
+        if device == "gpu":
+            backend = pg.createMooncakeBackend(dist_opts, back_opts)
+        elif device == "cpu":
+            backend = pg.createMooncakeCpuBackend(dist_opts, back_opts)
+        else:
+            raise ValueError(f"Unknown device: {device}")
         return ProcessGroupMooncake(backend)
 
     @staticmethod
