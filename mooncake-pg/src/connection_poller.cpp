@@ -237,11 +237,24 @@ bool ConnectionContext::pollPeer(int pollingRank) {
     auto globalPollingRank = local2global_rank_map_[pollingRank];
     auto& global_peerConnected_ =
         ConnectionPoller::GetInstance().global_peerConnected_;
+    auto& global_connectEpoch_ =
+        ConnectionPoller::GetInstance().global_connectEpoch_;
     auto& peerState = peerStates_[pollingRank];
     bool state_changed = false;
 
     switch (peerState.state) {
         case PeerConnectionState::WAITING_STORE: {
+            // Another context connected this peer since we last looked, so its
+            // metadata for this context is about to be published as well. Drop
+            // the backoff accumulated while the peer was absent (up to
+            // kCheckStoreMaxBackoffMs) instead of waiting out a full interval.
+            if (peerState.seen_connect_epoch !=
+                global_connectEpoch_[globalPollingRank]) {
+                peerState.seen_connect_epoch =
+                    global_connectEpoch_[globalPollingRank];
+                peerState.resetCheckStoreBackoff();
+            }
+
             // See if we need backoff
             auto now = std::chrono::steady_clock::now();
             auto elapsed = static_cast<size_t>(
@@ -295,6 +308,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                 // since CPU heap buffers aren't fabric-accessible anyway.
                 meta_->peerConnected[pollingRank] = true;
                 global_peerConnected_[globalPollingRank] = true;
+                ++global_connectEpoch_[globalPollingRank];
                 peerState.state = PeerConnectionState::CONNECTED;
                 {
                     std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
@@ -341,6 +355,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                 peerState.warmupBatchId = std::nullopt;
                 meta_->peerConnected[pollingRank] = true;
                 global_peerConnected_[globalPollingRank] = true;
+                ++global_connectEpoch_[globalPollingRank];
                 peerState.state = PeerConnectionState::CONNECTED;
 
                 {
@@ -373,6 +388,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                     &warmup_recv_region_[pollingRank])) {
                 meta_->peerConnected[pollingRank] = true;
                 global_peerConnected_[globalPollingRank] = true;
+                ++global_connectEpoch_[globalPollingRank];
                 peerState.state = PeerConnectionState::CONNECTED;
                 {
                     std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);

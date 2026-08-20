@@ -41,6 +41,11 @@ struct PeerConnection {
     std::chrono::steady_clock::time_point last_check_store;
     size_t check_store_backoff_ms{kCheckStoreInitialBackoffMs};
 
+    // Last value of ConnectionPoller::global_connectEpoch_ observed for this
+    // peer. A mismatch means another context has just connected the peer, which
+    // hints that its metadata for this context is about to land in the store.
+    uint64_t seen_connect_epoch{0};
+
     void increaseCheckStoreBackoff() {
         check_store_backoff_ms =
             (std::min)(check_store_backoff_ms * 2,
@@ -232,6 +237,13 @@ class ConnectionPoller {
     }
     // the global ranks
     bool global_peerConnected_[kMaxNumRanks]{};
+
+    // Bumped whenever a context transitions a peer into CONNECTED. Serves as a
+    // cross-context hint: a recovering rank rejoins all of its groups back to
+    // back, so once one group connects, the remaining ones are about to
+    // publish their metadata too and should not wait out a backoff that was
+    // sized for a long-absent peer. Only ever touched by the poller thread.
+    uint64_t global_connectEpoch_[kMaxNumRanks]{};
 
    private:
     ConnectionPoller();
